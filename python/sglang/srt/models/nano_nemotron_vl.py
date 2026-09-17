@@ -434,21 +434,33 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
         # reference to check against rather than a guess about where in the
         # projector it belongs.
         weights = list(weights)
-        unhandled = [
-            name
-            for name, _ in weights
-            if name.startswith("vision_projector.")
-            and not name.startswith("vision_projector.mlp1")
-        ]
+
+        # The parent routes on four prefixes and has no else branch, so ANY name
+        # outside them is dropped in silence. Check against the same four rather
+        # than against the vision_projector.* case alone -- the RL weight sync is
+        # the caller that gets this wrong, and it gets it wrong in bulk.
+        #
+        # Measured, on the checkpoint this class serves: 42,683 of its 43,078
+        # tensors live under `language_model.`. An exporter that forgets that
+        # prefix produces names the parent matches nowhere, and the engine comes
+        # up serving the weights it loaded at startup while reporting a
+        # successful sync -- forever, and with no line in any log. That is not
+        # hypothetical: slime's Megatron->HF exporter did exactly this the first
+        # time a VL run reached update_weights.
+        handled = ("language_model", "mlp1", "vision_model.radio_model.", "sound")
+        unhandled = [name for name, _ in weights if not name.startswith(handled)]
         if unhandled:
+            head = sorted(unhandled)[:8]
             logger.warning(
-                "NemotronH_Omni_Reasoning_V3: %d checkpoint tensor(s) have no "
-                "module on the NemotronH_Nano_VL_V2 graph and are NOT being "
-                "loaded: %s. The engine will serve, but its vision path differs "
-                "from the checkpoint. Do not read a reward or an eval score "
+                "NemotronH_Omni_Reasoning_V3: %d of %d incoming tensor(s) match none of the "
+                "prefixes this graph loads %s and are being DROPPED: %s%s. The engine will "
+                "serve, but not what you handed it -- do not read a reward or an eval score "
                 "from this run as a statement about the weights.",
                 len(unhandled),
-                sorted(unhandled),
+                len(weights),
+                list(handled),
+                head,
+                f" (+{len(unhandled) - len(head)} more)" if len(unhandled) > len(head) else "",
             )
 
         return super().load_weights(weights)
