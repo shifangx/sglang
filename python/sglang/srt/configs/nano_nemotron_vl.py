@@ -166,3 +166,41 @@ class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
         # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from
         # replacing the parent's custom __init__ with a dataclass-generated one.
         super().__init__(*args, **kwargs)
+
+
+class NemotronH_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
+    """Nemotron 3.5 Super VL — the non-Nano sibling of the class above.
+
+    Added locally (not upstream as of v0.5.15.post1) for
+    `nvidia/NVIDIA-Nemotron-3.5-Super-120B-A12B-SourceOfTruth`, whose
+    `config.json` carries::
+
+        "architectures": ["NemotronH_Omni_Reasoning_V3"]
+        "model_type":    "nemotron_h_omni"
+
+    `model_type` is what `_CONFIG_REGISTRY` keys on and what
+    `AutoConfig.register` checks against, so it is the checkpoint's own string
+    rather than the class name — unlike the two Nano configs, whose checkpoints
+    happen to spell `model_type` the same way as their architecture.
+
+    Everything else is inherited. The 3.5-Super config supplies every field the
+    parent's `__init__` reads (`vision_config` with `model_type: radio`,
+    `llm_config`, `downsample_ratio`, `projector_hidden_size`, `vit_hidden_size`,
+    `use_thumbnail`, `ps_version`, `image_tag_type`, `template`,
+    `video_pruning_rate`, `img_context_token`, `video_context_token`), and the
+    two it does not — `img_start_token` / `img_end_token` — have defaults there.
+    `sound_config` is present but null, which the parent already treats as "no
+    sound encoder".
+
+    Subclassing `NemotronH_Nano_VL_V2_Config` rather than standing a parallel
+    class up is deliberate: `model_executor/model_runner.py` dispatches on
+    `isinstance(config, NemotronH_Nano_VL_V2_Config)` to reach `config.llm_config`
+    for the hybrid Mamba-2 KV layout, and inheritance is what makes that keep
+    working without a second edit there.
+    """
+
+    model_type = "nemotron_h_omni"
+
+    def __init__(self, *args, **kwargs):
+        # Same reason as above: keep the parent's hand-written __init__.
+        super().__init__(*args, **kwargs)

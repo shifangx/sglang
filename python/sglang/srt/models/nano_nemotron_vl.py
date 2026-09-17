@@ -388,4 +388,74 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     pass
 
 
-EntryClass = [NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3]
+class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+    """Nemotron 3.5 Super VL — 88-layer hybrid tower, RADIO vision tower.
+
+    Added locally; not in upstream v0.5.15.post1, whose EntryClass carries only
+    the two Nano classes. `architectures[0]` of
+    `nvidia/NVIDIA-Nemotron-3.5-Super-120B-A12B-SourceOfTruth` is
+    `NemotronH_Omni_Reasoning_V3`, so without this the engine refuses to start.
+
+    The graph is inherited wholesale, and the checkpoint's own weight index is
+    what says that is the right call. Measured against its 43,078-tensor
+    `model.safetensors.index.json`:
+
+      * the projector is `mlp1.0.weight` / `mlp1.1.weight` / `mlp1.3.weight` --
+        the RMSNorm / Linear / ReLU^2 / Linear shape `NemotronH_Nano_VL_V2`
+        builds, under the name its `load_weights` already keys on. An earlier
+        port plan expected `vision_projector.*` here and a name mapping with it;
+        there is no mapping to write.
+      * the vision weights are `vision_model.radio_model.*`, which is the prefix
+        the parent strips.
+      * `vision_model.summary_idxs` is absent, as expected.
+
+    What is *not* inherited is `load_weights`, for the one discrepancy that
+    survived: see below.
+    """
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        # 3.5-Super carries two tensors the Nano checkpoints do not:
+        #
+        #   vision_projector.vision_final_layernorm.weight
+        #   vision_projector.vision_final_layernorm.bias
+        #
+        # The parent's load_weights sorts every incoming tensor into one of four
+        # prefixes -- language_model / mlp1 / vision_model.radio_model. / sound
+        # -- with **no else branch**. So these two would not raise; they would be
+        # dropped on the floor, and the engine would come up serving a model that
+        # is quietly missing a normalization the checkpoint was trained with.
+        # A silent numerical difference is a far worse failure than a crash,
+        # because every probe in this tree would report a healthy server.
+        #
+        # There is no module on the Nano path to receive them, so this cannot be
+        # fixed by loading them somewhere. What it can do is refuse to be silent:
+        # name them, and say what serving without them means. Implementing the
+        # module is the next piece of this port, and it needs a numerical
+        # reference to check against rather than a guess about where in the
+        # projector it belongs.
+        weights = list(weights)
+        unhandled = [
+            name
+            for name, _ in weights
+            if name.startswith("vision_projector.")
+            and not name.startswith("vision_projector.mlp1")
+        ]
+        if unhandled:
+            logger.warning(
+                "NemotronH_Omni_Reasoning_V3: %d checkpoint tensor(s) have no "
+                "module on the NemotronH_Nano_VL_V2 graph and are NOT being "
+                "loaded: %s. The engine will serve, but its vision path differs "
+                "from the checkpoint. Do not read a reward or an eval score "
+                "from this run as a statement about the weights.",
+                len(unhandled),
+                sorted(unhandled),
+            )
+
+        return super().load_weights(weights)
+
+
+EntryClass = [
+    NemotronH_Nano_VL_V2,
+    NemotronH_Nano_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3,
+]
