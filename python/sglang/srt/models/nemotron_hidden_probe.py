@@ -64,6 +64,9 @@ inside the batch rather than assuming it sits at the same offset.
 Environment:
   NEMOTRON_HIDDEN_PROBE_DIR       where to write. Unset or empty = off.
   NEMOTRON_HIDDEN_PROBE_FORWARDS  forwards to capture per engine (default 1).
+  NEMOTRON_HIDDEN_PROBE_MODES     which ForwardMode values to capture, by name
+                                  (default "EXTEND,MIXED" -- the prefill. "ALL"
+                                  for decode steps too).
   NEMOTRON_HIDDEN_PROBE_RANKS     comma-separated tp ranks (default "0", "all"
                                   for every rank -- hidden states are replicated
                                   across tp after the reduce, so rank 0 is
@@ -151,6 +154,27 @@ def attach(model) -> bool:
         except Exception:  # noqa: BLE001
             return False
 
+    want_modes = {m.strip().upper() for m in os.environ.get(
+        "NEMOTRON_HIDDEN_PROBE_MODES", "EXTEND,MIXED").split(",") if m.strip()}
+
+    def wanted(forward_batch) -> bool:
+        """Only the prefill, unless asked otherwise.
+
+        The first run of this captured a DECODE batch -- `forward_mode 2`,
+        `batch_size 195`, which is 195 requests of ONE token each, not one
+        195-token sequence. That is not the forward the question is about: the
+        first generated token comes out of the last row of the PREFILL, and a
+        decode step's input hidden states are the embeddings of tokens the two
+        runs had already diverged on.
+        """
+        if "ALL" in want_modes:
+            return True
+        mode = getattr(forward_batch, "forward_mode", None)
+        name = getattr(mode, "name", None)
+        if name is None:
+            return True  # unknown shape: capture rather than silently skip
+        return name.upper() in want_modes
+
     def wrapped(*args, **kwargs):
         # The caller is `self.model.forward(...)` (nemotron_h.py:1059), a direct
         # call on the METHOD. torch dispatches forward hooks from Module.__call__
@@ -170,9 +194,22 @@ def attach(model) -> bool:
                 return args[index]
             return kwargs.get(name)
 
+        forward_batch = pick(2, "forward_batch")
+        if not wanted(forward_batch):
+            return state["original"](*args, **kwargs)
+
+        # `input_ids` is None on the multimodal path: general_mm_embed_routine
+        # calls the language model with input_embeds instead. The ids are still
+        # on the batch, and without them the comparison has nothing to align on
+        # but sequence length -- which is how the first run silently "matched"
+        # two batches by their token count.
+        ids = pick(0, "input_ids")
+        if ids is None:
+            ids = getattr(forward_batch, "input_ids", None)
+
         record = {
-            "input_ids": _cpu(pick(0, "input_ids")),
-            "forward_batch": _seq_boundaries(pick(2, "forward_batch")),
+            "input_ids": _cpu(ids),
+            "forward_batch": _seq_boundaries(forward_batch),
             "input_hidden_states": _cpu(pick(4, "input_embeds")),
         }
         output = state["original"](*args, **kwargs)
@@ -224,7 +261,9 @@ def _cpu(tensor):
     """
     if not isinstance(tensor, torch.Tensor):
         return None
-    return tensor.detach().to(device="cpu", dtype=torch.float32).numpy()
+    tensor = tensor.detach().to(device="cpu")
+    # Token ids are integers and must stay exact -- fp32 is for the activations.
+    return (tensor if not tensor.is_floating_point() else tensor.to(torch.float32)).numpy()
 
 
 def _write(root: Path, rank: int, index: int, record: dict) -> None:
@@ -251,7 +290,10 @@ def _write(root: Path, rank: int, index: int, record: dict) -> None:
     try:
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"tp{rank}_forward{index:03d}.npz"
-        tmp = path.with_suffix(".npz.tmp")
+        # `.tmp.npz`, not `.npz.tmp`: np.savez appends `.npz` to any name that
+        # does not already end in it, so the latter is written as
+        # `...npz.tmp.npz` and os.replace below then fails on a missing source.
+        tmp = path.with_name(path.name.replace(".npz", ".tmp.npz"))
         np.savez(tmp, **arrays)
         os.replace(tmp, path)
     except Exception as exc:  # noqa: BLE001 -- never take the engine down for a log
