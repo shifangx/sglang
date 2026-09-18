@@ -64,6 +64,11 @@ inside the batch rather than assuming it sits at the same offset.
 Environment:
   NEMOTRON_HIDDEN_PROBE_DIR       where to write. Unset or empty = off.
   NEMOTRON_HIDDEN_PROBE_FORWARDS  forwards to capture per engine (default 1).
+  NEMOTRON_HIDDEN_PROBE_MIN_TOKENS
+                                  skip forwards narrower than this (default 32).
+                                  The engine's first EXTEND is a one-token
+                                  warmup; without this the probe captures that
+                                  and reports two runs agreeing on <unk>.
   NEMOTRON_HIDDEN_PROBE_MODES     which ForwardMode values to capture, by name
                                   (default "EXTEND,MIXED" -- the prefill. "ALL"
                                   for decode steps too).
@@ -156,6 +161,7 @@ def attach(model) -> bool:
 
     want_modes = {m.strip().upper() for m in os.environ.get(
         "NEMOTRON_HIDDEN_PROBE_MODES", "EXTEND,MIXED").split(",") if m.strip()}
+    min_tokens = int(os.environ.get("NEMOTRON_HIDDEN_PROBE_MIN_TOKENS", "32") or 0)
 
     def wanted(forward_batch) -> bool:
         """Only the prefill, unless asked otherwise.
@@ -196,6 +202,17 @@ def attach(model) -> bool:
 
         forward_batch = pick(2, "forward_batch")
         if not wanted(forward_batch):
+            return state["original"](*args, **kwargs)
+
+        # The engine's first EXTEND is its own warmup: one token, id 0, before a
+        # single request has arrived. Capturing it satisfies every check this
+        # probe makes -- prefill, ids present, ids identical across runs -- and
+        # says nothing, because one <unk> exercises no image, no sequence and
+        # essentially no routing. Two runs agreeing on it is not a result, and
+        # it read as one.
+        embeds = pick(4, "input_embeds")
+        n_tokens = int(embeds.shape[0]) if hasattr(embeds, "shape") else 0
+        if n_tokens < min_tokens:
             return state["original"](*args, **kwargs)
 
         # `input_ids` is None on the multimodal path: general_mm_embed_routine
