@@ -28,11 +28,18 @@ THE SEAM
     return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
 so ``language_model.model`` takes exactly the tensor this file calls INPUT and
-returns exactly the one it calls OUTPUT. Hooking that one module gets both, and
-gets them without touching `general_mm_embed_routine`, which every other VLM in
-the tree shares.
+returns exactly the one it calls OUTPUT. Intercepting that one method gets both,
+and gets them without touching `general_mm_embed_routine`, which every other VLM
+in the tree shares.
 
-It is deliberately NOT hooked on ``language_model``: that returns the logits
+**It wraps the bound method rather than registering a forward hook**, and that is
+not a style choice. The call above is ``self.model.forward(...)`` -- the method,
+directly -- and torch dispatches forward hooks from ``Module.__call__`` only. A
+``register_forward_hook`` on that module attaches successfully and never fires.
+This probe's first run proves it: ``hooked language_model.model`` in the log,
+three prefill batches, and not one file written.
+
+It deliberately does not intercept ``language_model``: that returns the logits
 processor's output, which is a different question and a much larger tensor.
 
 -----------------------------------------------------------------------------
@@ -127,7 +134,7 @@ def attach(model) -> bool:
 
     limit = int(os.environ.get("NEMOTRON_HIDDEN_PROBE_FORWARDS", "1") or 1)
     root = Path(directory)
-    state = {"calls": 0, "pending": None, "handles": []}
+    state = {"calls": 0, "original": tower.forward}
 
     def capturing() -> bool:
         """True while a CUDA graph is being captured.
@@ -144,56 +151,63 @@ def attach(model) -> bool:
         except Exception:  # noqa: BLE001
             return False
 
-    def pre_hook(_module, args, kwargs):
+    def wrapped(*args, **kwargs):
+        # The caller is `self.model.forward(...)` (nemotron_h.py:1059), a direct
+        # call on the METHOD. torch dispatches forward hooks from Module.__call__
+        # only, so register_forward_hook here attaches successfully and never
+        # fires -- which is exactly how this probe spent its first run: "hooked
+        # language_model.model" in the log, three prefill batches, and not one
+        # file. Wrapping the bound method is what actually intercepts that call
+        # site, and works whether the caller uses __call__ or .forward().
         if capturing():
-            state["pending"] = None
-            return None
-        # nemotron_h.py calls this positionally:
-        #   (input_ids, positions, forward_batch, pp_proxy_tensors, input_embeds)
-        # but read it defensively -- a signature change upstream should cost a
-        # missing field in a debug dump, not a dead engine.
+            return state["original"](*args, **kwargs)
+
         def pick(index, name):
+            # Positional at the call site, but read defensively: a signature
+            # change upstream should cost a missing field in a debug dump, not a
+            # dead engine.
             if len(args) > index:
                 return args[index]
             return kwargs.get(name)
 
-        state["pending"] = {
+        record = {
             "input_ids": _cpu(pick(0, "input_ids")),
             "forward_batch": _seq_boundaries(pick(2, "forward_batch")),
             "input_hidden_states": _cpu(pick(4, "input_embeds")),
         }
-        return None
-
-    def post_hook(_module, _args, output):
-        if capturing():
-            return output
-        record = state["pending"]
-        state["pending"] = None
-        if record is None:
-            return output
+        output = state["original"](*args, **kwargs)
         record["output_hidden_states"] = _cpu(output if isinstance(output, torch.Tensor) else None)
+
         index = state["calls"]
         state["calls"] += 1
         _write(root, rank, index, record)
         if state["calls"] >= limit:
-            for handle in state["handles"]:
-                handle.remove()
-            state["handles"].clear()
+            detach(tower, state)
             logger.info("nemotron-probe: captured %d forward(s) on tp rank %d; detached", limit, rank)
         return output
 
-    state["handles"] = [
-        tower.register_forward_pre_hook(pre_hook, with_kwargs=True),
-        tower.register_forward_hook(post_hook),
-    ]
+    tower.forward = wrapped
     _ATTACHED.add(id(model))
     logger.info(
-        "nemotron-probe: hooked language_model.model on tp rank %d, %d forward(s) -> %s",
+        "nemotron-probe: wrapped language_model.model.forward on tp rank %d, %d forward(s) -> %s",
         rank,
         limit,
         root,
     )
     return True
+
+
+def detach(tower, state) -> None:
+    """Put the real method back. Deleting the instance attribute is enough --
+    it was shadowing the class's, which is untouched."""
+    try:
+        del tower.forward
+    except AttributeError:
+        # Already gone, or nn.Module refused; fall back to rebinding.
+        try:
+            tower.forward = state["original"]
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _cpu(tensor):
