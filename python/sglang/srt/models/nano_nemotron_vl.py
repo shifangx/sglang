@@ -37,6 +37,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
+from sglang.srt.models.nemotron_hidden_probe import attach as attach_hidden_probe
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
@@ -412,6 +413,15 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     What is *not* inherited is `load_weights`, for the one discrepancy that
     survived: see below.
     """
+
+    def forward(self, *args, **kwargs):
+        # The only reason this override exists: attach the hidden-state probe on
+        # the first forward, once the tower is built and before anything is
+        # generated. Off unless NEMOTRON_HIDDEN_PROBE_DIR is set, detaches itself
+        # after N forwards, and scoped to this class so the two Nano classes are
+        # untouched. See nemotron_hidden_probe.py for what it captures and why.
+        attach_hidden_probe(self)
+        return super().forward(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # 3.5-Super carries two tensors the Nano checkpoints do not:
