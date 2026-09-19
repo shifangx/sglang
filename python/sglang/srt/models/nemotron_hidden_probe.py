@@ -84,6 +84,63 @@ Environment:
                                   across tp after the reduce, so rank 0 is
                                   representative and the rest are a consistency
                                   check).
+
+-----------------------------------------------------------------------------
+THE SECOND SEAM: INSIDE THE VISION HALF
+
+The seam above answered its question and left a finer one. Two runs' INPUT
+hidden states are bitwise equal on every text position and cosine 0.19-0.25 on
+the image block, so the difference is made somewhere between the pixels and the
+projector's output -- and that stretch has three stages, of which only the last
+one has ever been looked at::
+
+    pixel_values      [n_images, 3, H, W]     <- the processor's output
+        -> RadioModel (patch_generator + 32 encoder blocks)
+    ==> tower output  [.., patches, 1280]     <- NEVER MEASURED on either side
+        -> pixel_shuffle  (pure reshape, no parameters)
+    ==> mlp1 input    [.., patches/4, 5120]
+        -> mlp1  RMSNorm -> Linear -> ReLU^2 -> Linear
+    ==> image features[.., patches/4, 4096]   <- this is the image block above
+
+``NEMOTRON_HIDDEN_PROBE_VISION=1`` captures all four, and the three-way verdict
+it produces is the point of it::
+
+    pixels equal + tower equal + features differ  =>  the projector (mlp1)
+    pixels equal + tower differs                  =>  the tower
+    pixels differ                                 =>  the preprocessing
+
+The tower's weights have been checked tensor by tensor and match; that is an
+argument about four of 391 tensors, and this is a measurement of the function
+they compute. `mlp1` has never been checked at all -- it is not loaded by
+``RadioModel.load_weights`` but by ``adapter_dict`` + ``default_weight_loader``
+one level up, so neither the drop warning nor the emit/arrive norm trace has
+ever seen it, and unlike the tower it is not frozen.
+
+**It hooks rather than wraps here**, because unlike ``language_model.model``
+these are called as ``self.vision_model(chunk)`` and ``self.mlp1(feats)`` --
+through ``Module.__call__``, which is exactly what dispatches forward hooks.
+``get_image_feature`` is the exception and is wrapped: it is a bound method the
+forward hands to ``general_mm_embed_routine`` by reference.
+
+Aligning two runs here cannot key on token ids -- there are none at this depth.
+It keys on **the pixels themselves**: a sha256 per image over the exact fp32
+bytes handed to the tower. Which makes the alignment key and the first question
+the same object, and that is deliberate -- if the digests do not match, that is
+not a failure to align, it is the answer.
+
+Environment:
+  NEMOTRON_HIDDEN_PROBE_VISION    1 to capture the vision half (default off).
+  NEMOTRON_HIDDEN_PROBE_VISION_CALLS
+                                  get_image_feature calls to capture (default 2:
+                                  the engine's first prefill is one request, the
+                                  next is a full batch).
+  NEMOTRON_HIDDEN_PROBE_VISION_MAX_ELEMS
+                                  per-tensor element budget (default 4e6 = 16 MB
+                                  at fp32). Bigger tensors are kept head-first
+                                  and the full shape, fp64 norm and digest go to
+                                  the metadata regardless, so a truncated tensor
+                                  still answers "are these the same" -- it just
+                                  cannot say where they differ past the cut.
 """
 
 from __future__ import annotations
@@ -273,6 +330,279 @@ def detach(tower, state) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# The vision half: pixels -> RADIO tower -> pixel shuffle -> mlp1 -> features
+
+
+_VISION_ATTACHED: set[int] = set()
+
+
+def _vision_wanted() -> bool:
+    if not os.environ.get("NEMOTRON_HIDDEN_PROBE_DIR", "").strip():
+        return False
+    raw = os.environ.get("NEMOTRON_HIDDEN_PROBE_VISION", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _capturing() -> bool:
+    """True while a CUDA graph is being captured -- see `attach.capturing`."""
+    try:
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _digest(array) -> str:
+    """A content key for a tensor, over its exact bytes.
+
+    This is the alignment key for the vision dumps, and it is deliberately the
+    same object as the first question: two runs whose `pixel_values` digests
+    match handed the tower the same tensor, and two runs whose digests do not
+    match have already answered why their image features differ.
+    """
+    import hashlib
+
+    import numpy as np
+
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()[:16]
+
+
+def _norm64(array) -> float:
+    """fp64, always. An fp32 norm over 21M elements reads 0.1% low -- it lost
+    `pos_embed` to a false mismatch once already."""
+    import numpy as np
+
+    return float(np.linalg.norm(np.asarray(array, dtype=np.float64)))
+
+
+def _head(array, budget: int):
+    """The leading slice of `array` that fits in `budget` elements.
+
+    Head-first rather than a stride, because the leading axis is images (or
+    tokens, which are grouped by image), so a head keeps whole images and a
+    stride keeps none. The metadata records the full shape and the full tensor's
+    norm and digest either way, so a truncated array can still answer "are these
+    the same" -- it just cannot say where past the cut.
+    """
+    import numpy as np
+
+    if array.ndim == 0 or array.size <= budget:
+        return array
+    axis = 0 if array.shape[0] > 1 else (1 if array.ndim > 1 else 0)
+    per_slice = max(array.size // max(array.shape[axis], 1), 1)
+    keep = max(budget // per_slice, 1)
+    index = [slice(None)] * array.ndim
+    index[axis] = slice(0, keep)
+    return np.ascontiguousarray(array[tuple(index)])
+
+
+def _note(arrays: dict, meta: dict, key: str, value, budget: int) -> None:
+    """Record one tensor: the head of it as an array, all of it as metadata."""
+    array = _cpu(value)
+    if array is None:
+        meta[key] = {"missing": type(value).__name__}
+        return
+    info = {
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "norm": _norm64(array),
+        "digest": _digest(array),
+    }
+    kept = _head(array, budget)
+    if kept.shape != array.shape:
+        info["kept_shape"] = list(kept.shape)
+    arrays[key] = kept
+    meta[key] = info
+
+
+def _note_images(arrays: dict, meta: dict, key: str, value, budget: int) -> None:
+    """Record `pixel_values`, per image.
+
+    It arrives one of two ways -- a list of per-image tensors on the dynamic
+    resolution path, or one `[n_images, 3, H, W]` stack on the static one -- and
+    the comparison needs the images apart either way, because the two runs do
+    not have to batch them the same.
+    """
+    items = None
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    elif isinstance(value, torch.Tensor) and value.ndim == 4:
+        items = [value[i] for i in range(value.shape[0])]
+    if items is None:
+        _note(arrays, meta, key, value, budget)
+        return
+
+    per_image, spent = [], 0
+    for position, item in enumerate(items):
+        array = _cpu(item)
+        if array is None:
+            per_image.append({"missing": type(item).__name__})
+            continue
+        entry = {
+            "shape": list(array.shape),
+            "norm": _norm64(array),
+            "digest": _digest(array),
+        }
+        if spent + array.size <= budget:
+            arrays[f"{key}_{position:03d}"] = array
+            spent += array.size
+        else:
+            entry["dropped"] = True
+        per_image.append(entry)
+    meta[key] = {"images": len(items), "per_image": per_image}
+
+
+def _tensor_of(output):
+    """The tensor in a stage's return value, and whatever else it carried.
+
+    `RadioModel.forward` returns a bare tensor on the static path and
+    `(features, num_patches_list)` on the dynamic one -- and `num_patches_list`
+    is not decoration, it is how the comparison finds image `i`'s rows inside a
+    concatenated `[1, total_patches, 1280]`.
+    """
+    if isinstance(output, torch.Tensor):
+        return output, None
+    if isinstance(output, (tuple, list)) and output:
+        extra = [x for x in output[1:] if isinstance(x, (int, float, list, tuple))]
+        return (output[0] if isinstance(output[0], torch.Tensor) else None), extra or None
+    return None, None
+
+
+def attach_vision(model) -> bool:
+    """Capture the four tensors of the vision half, once per `get_image_feature`.
+
+    Off unless NEMOTRON_HIDDEN_PROBE_VISION=1, detaches itself after
+    NEMOTRON_HIDDEN_PROBE_VISION_CALLS, and never raises into the engine.
+    """
+    if not _vision_wanted():
+        return False
+    if id(model) in _VISION_ATTACHED:
+        return True
+
+    ranks = _enabled_ranks()
+    rank = _tp_rank()
+    if "all" not in ranks and str(rank) not in ranks:
+        _VISION_ATTACHED.add(id(model))
+        return False
+
+    tower = getattr(model, "vision_model", None)
+    projector = getattr(model, "mlp1", None)
+    original = getattr(model, "get_image_feature", None)
+    if tower is None or projector is None or original is None:
+        logger.warning(
+            "nemotron-probe: no vision_model / mlp1 / get_image_feature to hook;"
+            " vision probe not attached"
+        )
+        _VISION_ATTACHED.add(id(model))
+        return False
+
+    root = Path(os.environ["NEMOTRON_HIDDEN_PROBE_DIR"].strip())
+    limit = int(os.environ.get("NEMOTRON_HIDDEN_PROBE_VISION_CALLS", "2") or 2)
+    budget = int(float(os.environ.get("NEMOTRON_HIDDEN_PROBE_VISION_MAX_ELEMS", "8e6") or 8e6))
+    state: dict = {"calls": 0, "open": None, "handles": []}
+
+    def stage(name: str, module, images: bool = False, inputs: bool = True):
+        """A forward hook that files this stage's tensors into the open record.
+
+        A hook and not a method wrap, unlike `attach`: these stages are reached
+        through `Module.__call__` (`self.vision_model(chunk)`, `self.mlp1(x)`),
+        which is the one path that dispatches hooks at all.
+        """
+
+        def hook(_module, hook_inputs, output):
+            record = state["open"]
+            if record is None or _capturing():
+                return
+            try:
+                call = record["counts"].get(name, 0)
+                record["counts"][name] = call + 1
+                if inputs and hook_inputs:
+                    note = _note_images if images else _note
+                    note(record["arrays"], record["meta"],
+                         f"{name}_in_{call:03d}", hook_inputs[0], budget)
+                tensor, extra = _tensor_of(output)
+                _note(record["arrays"], record["meta"], f"{name}_out_{call:03d}", tensor, budget)
+                if extra is not None:
+                    record["meta"][f"{name}_out_{call:03d}_extra"] = extra
+            except Exception as exc:  # noqa: BLE001 -- never take the engine down for a log
+                logger.warning("nemotron-probe: vision stage %s failed: %s: %s",
+                               name, type(exc).__name__, exc)
+
+        state["handles"].append(module.register_forward_hook(hook))
+
+    stage("tower", tower, images=True)
+    stage("mlp1", projector)
+    # Inside the projector, outputs only -- each stage's input is the previous
+    # stage's output, and storing both doubles the file to say the same thing.
+    # mlp1[2] is ReLU^2, which has no parameters and cannot be loaded wrong.
+    try:
+        stage("mlp1_rmsnorm", projector[0], inputs=False)
+        stage("mlp1_fc1", projector[1], inputs=False)
+    except (TypeError, IndexError):
+        logger.warning("nemotron-probe: mlp1 is not indexable; projector stages skipped")
+
+    def wrapped(items):
+        if state["calls"] >= limit or _capturing():
+            return original(items)
+        record = {
+            "arrays": {},
+            "meta": {
+                "num_items": len(items) if hasattr(items, "__len__") else None,
+                # Which of the two extract paths ran. They differ in more than
+                # batching -- the dynamic one concatenates every image into one
+                # `[1, total_patches, 1280]` and calls mlp1 per image, the static
+                # one keeps images on dim 0 and calls mlp1 once per micro-batch.
+                "is_dynamic": bool(
+                    any(getattr(item, "is_dynamic", False) for item in items)
+                ) if hasattr(items, "__iter__") else None,
+            },
+            "counts": {},
+        }
+        state["open"] = record
+        try:
+            output = original(items)
+        finally:
+            state["open"] = None
+
+        try:
+            _note(record["arrays"], record["meta"], "image_features", output, budget)
+            record["meta"]["stage_calls"] = record["counts"]
+            index = state["calls"]
+            state["calls"] += 1
+            _write(root, rank, index, {"meta": record["meta"], **record["arrays"]}, kind="vision")
+            if state["calls"] >= limit:
+                detach_vision(model, state)
+                logger.info(
+                    "nemotron-probe: captured %d vision call(s) on tp rank %d; detached",
+                    limit, rank,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("nemotron-probe: could not write vision call: %s: %s",
+                           type(exc).__name__, exc)
+        return output
+
+    model.get_image_feature = wrapped
+    _VISION_ATTACHED.add(id(model))
+    logger.info(
+        "nemotron-probe: vision probe on tp rank %d, %d call(s), %d elem budget -> %s",
+        rank, limit, budget, root,
+    )
+    return True
+
+
+def detach_vision(model, state) -> None:
+    for handle in state.get("handles", ()):
+        try:
+            handle.remove()
+        except Exception:  # noqa: BLE001
+            pass
+    state["handles"] = []
+    try:
+        del model.get_image_feature
+    except AttributeError:
+        pass
+
+
 def _cpu(tensor):
     """Detached fp32 numpy copy on the host, or None.
 
@@ -332,7 +662,7 @@ def _writer_id() -> str:
     return _WRITER_ID
 
 
-def _write(root: Path, rank: int, index: int, record: dict) -> None:
+def _write(root: Path, rank: int, index: int, record: dict, kind: str = "forward") -> None:
     import json
 
     import numpy as np
@@ -345,12 +675,15 @@ def _write(root: Path, rank: int, index: int, record: dict) -> None:
                     arrays[f"fb_{field}"] = sub.numpy()
                 else:
                     meta[field] = sub
+        elif key == "meta":
+            meta.update(value or {})
         elif value is not None:
             arrays[key] = value
         else:
             meta[f"{key}_missing"] = True
     meta["tp_rank"] = rank
     meta["forward_index"] = index
+    meta["kind"] = kind
     meta["writer"] = _writer_id()
     arrays["meta_json"] = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
 
@@ -358,7 +691,7 @@ def _write(root: Path, rank: int, index: int, record: dict) -> None:
         root.mkdir(parents=True, exist_ok=True)
         # `_writer_id()` and not just the tp rank -- see its docstring. Four
         # engines all have a tp rank 0 and all write here.
-        path = root / f"tp{rank}_forward{index:03d}_{_writer_id()}.npz"
+        path = root / f"tp{rank}_{kind}{index:03d}_{_writer_id()}.npz"
         # `.tmp.npz`, not `.npz.tmp`: np.savez appends `.npz` to any name that
         # does not already end in it, so the latter is written as
         # `...npz.tmp.npz` and os.replace below then fails on a missing source.

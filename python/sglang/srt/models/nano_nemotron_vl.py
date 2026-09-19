@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.nemotron_hidden_probe import attach as attach_hidden_probe
+from sglang.srt.models.nemotron_hidden_probe import attach_vision as attach_vision_probe
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
@@ -421,6 +422,14 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
         # after N forwards, and scoped to this class so the two Nano classes are
         # untouched. See nemotron_hidden_probe.py for what it captures and why.
         attach_hidden_probe(self)
+        # And the second seam, inside the vision half. Separately gated
+        # (NEMOTRON_HIDDEN_PROBE_VISION=1) because it is the more expensive
+        # capture and only the vision question needs it. It must run before
+        # `super().forward`, which reads `self.get_image_feature` into the
+        # dispatch dict it hands to `general_mm_embed_routine` -- the attach
+        # shadows that attribute, so attaching after the read would wrap a
+        # method nobody is going to call.
+        attach_vision_probe(self)
         return super().forward(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
