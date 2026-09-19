@@ -49,6 +49,13 @@ hidden_size is 4096, so a 380-token prefill is 3.1 MB per tensor, 6.2 MB for the
 pair. The default is the first forward only, on tp rank 0 only, which is one
 file of a few MB per engine. A decode step is one token wide and costs nothing.
 
+Be aware that a *batched* prefill is not a 380-token one: 24 requests at 8192
+tokens is 268 MB a file, and `NEMOTRON_HIDDEN_PROBE_FORWARDS=8` across four
+engines is a couple of GB. Worth it once; not worth leaving on.
+
+Files are `tp<rank>_forward<NNN>_<host>-<pid>.npz`. The writer suffix is not
+decoration -- see `_writer_id`.
+
 **It is off unless NEMOTRON_HIDDEN_PROBE_DIR is set**, and it detaches itself
 after the configured number of forwards, so a run that forgets to unset it pays
 for one batch and nothing more.
@@ -83,6 +90,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from pathlib import Path
 
 import torch
@@ -90,6 +98,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 _ATTACHED: set[int] = set()
+_WRITER_ID: str | None = None
 
 
 def _enabled_ranks() -> set[str]:
@@ -283,6 +292,46 @@ def _cpu(tensor):
     return (tensor if not tensor.is_floating_point() else tensor.to(torch.float32)).numpy()
 
 
+def _writer_id() -> str:
+    """What separates one engine's files from another's in a shared directory.
+
+    The probe's first working capture (job 18919994) lost most of what it took,
+    and the log said so once::
+
+        nemotron-probe: could not write forward 0: FileNotFoundError:
+          '…/hidden/tp0_forward000.tmp.npz' -> '…/hidden/tp0_forward000.npz'
+
+    `NEMOTRON_HIDDEN_PROBE_RANKS=0` is tp rank 0 **of every engine**, and this
+    recipe runs four of them into one `NEMOTRON_HIDDEN_PROBE_DIR`. All four
+    computed the same `tp0_forward000.npz`, and therefore the same
+    `tp0_forward000.tmp.npz`. Three ways that goes wrong, in increasing
+    nastiness:
+
+    * two `os.replace` calls race and the loser raises `FileNotFoundError` on a
+      source another engine already renamed -- the loud case, and the only one
+      that leaves a trace;
+    * the file that survives is whichever engine won, and nothing in it says
+      which;
+    * engine X writes the tmp file, engine Y overwrites it, X renames it --
+      so the *contents* can belong to an engine other than the one that put
+      them there. Silent, and it corrupts a comparison rather than failing it.
+
+    host + pid fixes all three: unique per writer, stable for the life of the
+    engine, and legible in an `ls`. It is also recorded in `meta["writer"]`, so
+    a file answers "which engine" without being parsed by name.
+
+    Cached because `gethostname` is a syscall and this runs per forward.
+    """
+    global _WRITER_ID
+    if _WRITER_ID is None:
+        try:
+            host = socket.gethostname().split(".")[0]
+        except Exception:  # noqa: BLE001 -- a probe must never be the reason a server dies
+            host = "unknown"
+        _WRITER_ID = f"{host}-{os.getpid()}"
+    return _WRITER_ID
+
+
 def _write(root: Path, rank: int, index: int, record: dict) -> None:
     import json
 
@@ -302,11 +351,14 @@ def _write(root: Path, rank: int, index: int, record: dict) -> None:
             meta[f"{key}_missing"] = True
     meta["tp_rank"] = rank
     meta["forward_index"] = index
+    meta["writer"] = _writer_id()
     arrays["meta_json"] = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
 
     try:
         root.mkdir(parents=True, exist_ok=True)
-        path = root / f"tp{rank}_forward{index:03d}.npz"
+        # `_writer_id()` and not just the tp rank -- see its docstring. Four
+        # engines all have a tp rank 0 and all write here.
+        path = root / f"tp{rank}_forward{index:03d}_{_writer_id()}.npz"
         # `.tmp.npz`, not `.npz.tmp`: np.savez appends `.npz` to any name that
         # does not already end in it, so the latter is written as
         # `...npz.tmp.npz` and os.replace below then fails on a missing source.
