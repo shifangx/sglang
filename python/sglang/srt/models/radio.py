@@ -580,6 +580,7 @@ class RadioModel(nn.Module):
         }
 
         loaded_params: set[str] = set()
+        skipped: list[str] = []
         params_dict = dict(self.named_parameters())
 
         if isinstance(weights, dict):
@@ -600,6 +601,31 @@ class RadioModel(nn.Module):
                 loaded_params.add(name)
                 if "video_embedder" in name:
                     self.model.patch_generator._video_embedder_loaded = True
+            else:
+                # There used to be no else branch, which meant: a radio tensor
+                # whose remapped name is not a parameter of this module is
+                # dropped without a word. At startup that is caught downstream,
+                # because the engine checks what it loaded against what the graph
+                # expected. At an RL weight sync nobody checks -- so the tower
+                # keeps its startup value for that tensor, the sync reports
+                # success, and the engine serves a model that is part old and
+                # part new. That is the same failure `nano_nemotron_vl`'s
+                # load_weights already refuses to be silent about one level up,
+                # for the prefix routing rather than the remap.
+                skipped.append(name)
+
+        if skipped:
+            head = sorted(skipped)[:8]
+            logger.warning(
+                "RadioModel: %d of %d incoming radio tensor(s) remapped to a name this module "
+                "has no parameter for, and are being DROPPED: %s%s. The tower is now part "
+                "startup weights and part whatever did land -- do not read a reward or an eval "
+                "score from this run as a statement about the weights.",
+                len(skipped),
+                len(weights_list),
+                head,
+                f" (+{len(skipped) - len(head)} more)" if len(skipped) > len(head) else "",
+            )
 
         return loaded_params
 

@@ -473,7 +473,47 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
                 f" (+{len(unhandled) - len(head)} more)" if len(unhandled) > len(head) else "",
             )
 
-        return super().load_weights(weights)
+        result = super().load_weights(weights)
+        self._trace_vision_arrival()
+        return result
+
+    # The tensors slime fingerprints on the way out
+    # (`megatron_to_hf/nemotron_h.py::_VISION_TRACE_SUFFIXES`). Matched by
+    # suffix rather than by full name because `RadioModel.load_weights` remaps
+    # on the way in -- `blocks`→`encoder.layers`, `attn`→`attn.attn`,
+    # `qkv`→`qkv_proj` -- and a trace that has to be kept in sync with a remap
+    # table is a trace that will silently stop matching.
+    _VISION_TRACE_SUFFIXES = (
+        "patch_generator.embedder.weight",
+        "patch_generator.pos_embed",
+        "patch_generator.cls_token.token",
+    )
+
+    def _trace_vision_arrival(self) -> None:
+        """The other end of slime's `nemotron-vision-trace: emit` line.
+
+        Same four tensors, same norms, read back out of the live module after the
+        loader has finished. The pair localises a wrong number to one side of the
+        wire without a second job: wrong at `emit` is the exporter or the
+        Megatron load, right at `emit` and wrong here is this loader.
+
+        Every patch of every image goes through `patch_generator` before block 0,
+        so one of those three wrong is a global corruption of the tower output --
+        which is the shape the divergence under investigation actually has.
+        """
+        try:
+            params = dict(self.vision_model.named_parameters())
+            reported = []
+            for name, param in params.items():
+                is_traced = name.endswith(self._VISION_TRACE_SUFFIXES) or (
+                    "layers.0." in name and "qkv" in name and name.endswith("weight")
+                )
+                if is_traced:
+                    reported.append(f"{name} norm={float(param.detach().float().norm()):.6f}")
+            if reported:
+                logger.info("nemotron-vision-trace: arrived %s", "  ".join(sorted(reported)))
+        except Exception as exc:  # noqa: BLE001 -- a trace must not be why a sync dies
+            logger.warning("nemotron-vision-trace: could not read back (%s: %s)", type(exc).__name__, exc)
 
 
 EntryClass = [
