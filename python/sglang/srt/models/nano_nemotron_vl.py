@@ -40,6 +40,7 @@ from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.nemotron_hidden_probe import attach as attach_hidden_probe
 from sglang.srt.models.nemotron_hidden_probe import attach_vision as attach_vision_probe
 from sglang.srt.models.nemotron_hidden_probe import attach_weights as attach_weight_probe
+from sglang.srt.models.nemotron_hidden_probe import note_weight_load
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
@@ -431,11 +432,14 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
         # shadows that attribute, so attaching after the read would wrap a
         # method nobody is going to call.
         attach_vision_probe(self)
-        # And the weights those stages run with, fingerprinted once. Cheap
-        # enough (a few KB) to leave on with NEMOTRON_HIDDEN_PROBE_RANKS=all,
-        # and it has to happen here rather than at load time: the question is
-        # what the module holds when the forward reads it, after the remap, the
-        # weight_loader, the TP split and any startup transform.
+        # And the weights those stages run with, re-fingerprinted whenever
+        # load_weights has run since the last look. Cheap enough (a few KB) to
+        # leave on with NEMOTRON_HIDDEN_PROBE_RANKS=all. It reads at FORWARD
+        # time rather than at load time on purpose -- the question is what the
+        # module holds when the kernel reads it, after the remap, the
+        # weight_loader, the TP split and any startup transform -- but it has to
+        # be gated on the load epoch, or it fires during the startup warmup and
+        # never again, which is the wrong side of the weight sync.
         attach_weight_probe(self)
         return super().forward(*args, **kwargs)
 
@@ -491,6 +495,11 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
 
         result = super().load_weights(weights)
         self._trace_vision_arrival()
+        # Tell the weight fingerprint that the module changed under it, so the
+        # next forward re-reads. Without this it dumped once, at the first
+        # forward -- which on the training side is the startup warmup, before
+        # the first update_weights_from_tensor has run at all.
+        note_weight_load(self)
         return result
 
     # The tensors slime fingerprints on the way out

@@ -607,7 +607,28 @@ def detach_vision(model, state) -> None:
 # The weights the tower actually runs with
 
 
-_WEIGHTS_ATTACHED: set[int] = set()
+_WEIGHT_STATE: dict[int, dict] = {}
+_LOAD_EPOCH: dict[int, int] = {}
+
+
+def note_weight_load(model) -> None:
+    """Record that `load_weights` ran, so the next forward re-fingerprints.
+
+    This exists because the first version of `attach_weights` dumped once, at
+    the first forward, and that is the WRONG MOMENT on the side that matters.
+    The engine's first forward is its startup warmup and CUDA-graph capture --
+    job 18934040 fingerprinted at 00:49:38, and slime's first
+    `update_weights_from_tensor` had not run at all (`nemotron-vision-trace:
+    emit` count 0). So the training run's dump was the startup HF weights, and
+    comparing it against the rollout-only run would have shown them equal and
+    proved nothing, in a way that reads exactly like a clean result.
+
+    A sync calls `load_weights` once per bucket -- 461 of them -- so this
+    increments 461 times and the next forward dumps once. That is the intended
+    behaviour: the counter says "something changed since you last looked", not
+    "how many times".
+    """
+    _LOAD_EPOCH[id(model)] = _LOAD_EPOCH.get(id(model), 0) + 1
 
 
 def _weights_wanted() -> bool:
@@ -618,7 +639,12 @@ def _weights_wanted() -> bool:
 
 
 def attach_weights(model) -> bool:
-    """Fingerprint every live vision parameter at the first forward.
+    """Fingerprint every live vision parameter, once per weight load.
+
+    Dump 0 is the startup load; dump 1 on the training side is the state after
+    `update_weights_from_tensor`. Comparing A's LAST dump against B's is the
+    measurement -- see `note_weight_load` for the mistake that made this a
+    per-load dump rather than a one-shot at the first forward.
 
     Same pixels in and a near-orthogonal tower output out (doc 08) leaves two
     shapes: some of the tower's 391 tensors arrive wrong, or they arrive intact
@@ -650,26 +676,37 @@ def attach_weights(model) -> bool:
     KB a file, no activation-sized copies. `NEMOTRON_HIDDEN_PROBE_RANKS=all` is
     the useful setting here, unlike for the hidden states.
     """
-    if not _weights_wanted():
+    if not _weights_wanted() or _capturing():
+        # `_capturing()` is not belt and braces here: this copies every vision
+        # parameter to the host, and a device-to-host copy inside a CUDA graph
+        # capture is illegal. The engine captures graphs during the same startup
+        # window this used to fire in.
         return False
-    if id(model) in _WEIGHTS_ATTACHED:
-        return True
 
     ranks = _enabled_ranks()
     rank = _tp_rank()
     if "all" not in ranks and str(rank) not in ranks:
-        _WEIGHTS_ATTACHED.add(id(model))
+        return False
+
+    state = _WEIGHT_STATE.setdefault(id(model), {"dumps": 0, "epoch": None})
+    limit = int(os.environ.get("NEMOTRON_HIDDEN_PROBE_WEIGHT_DUMPS", "4") or 4)
+    epoch = _LOAD_EPOCH.get(id(model), 0)
+    if state["dumps"] >= limit or epoch == state["epoch"]:
         return False
 
     root = Path(os.environ["NEMOTRON_HIDDEN_PROBE_DIR"].strip())
-    _WEIGHTS_ATTACHED.add(id(model))
     try:
         record = _fingerprint_vision(model)
     except Exception as exc:  # noqa: BLE001 -- never take the engine down for a log
         logger.warning("nemotron-probe: could not fingerprint vision weights: %s: %s",
                        type(exc).__name__, exc)
+        state["epoch"] = epoch
         return False
-    _write(root, rank, 0, record, kind="weights")
+    record["meta"]["load_epoch"] = epoch
+    index = state["dumps"]
+    state["dumps"] += 1
+    state["epoch"] = epoch
+    _write(root, rank, index, record, kind="weights")
     return True
 
 
