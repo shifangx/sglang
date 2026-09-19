@@ -39,6 +39,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.nemotron_hidden_probe import attach as attach_hidden_probe
 from sglang.srt.models.nemotron_hidden_probe import attach_vision as attach_vision_probe
+from sglang.srt.models.nemotron_hidden_probe import attach_weights as attach_weight_probe
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
@@ -430,6 +431,12 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
         # shadows that attribute, so attaching after the read would wrap a
         # method nobody is going to call.
         attach_vision_probe(self)
+        # And the weights those stages run with, fingerprinted once. Cheap
+        # enough (a few KB) to leave on with NEMOTRON_HIDDEN_PROBE_RANKS=all,
+        # and it has to happen here rather than at load time: the question is
+        # what the module holds when the forward reads it, after the remap, the
+        # weight_loader, the TP split and any startup transform.
+        attach_weight_probe(self)
         return super().forward(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

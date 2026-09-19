@@ -603,6 +603,118 @@ def detach_vision(model, state) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# The weights the tower actually runs with
+
+
+_WEIGHTS_ATTACHED: set[int] = set()
+
+
+def _weights_wanted() -> bool:
+    if not os.environ.get("NEMOTRON_HIDDEN_PROBE_DIR", "").strip():
+        return False
+    raw = os.environ.get("NEMOTRON_HIDDEN_PROBE_WEIGHTS", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def attach_weights(model) -> bool:
+    """Fingerprint every live vision parameter at the first forward.
+
+    Same pixels in and a near-orthogonal tower output out (doc 08) leaves two
+    shapes: some of the tower's 391 tensors arrive wrong, or they arrive intact
+    and are filed under the wrong parameter. Both are statements about **the
+    values the module holds when it runs**, and everything measured so far is a
+    statement about something else -- what the checkpoint holds, what the
+    exporter emits, what four traced tensors looked like on arrival.
+
+    This reads the parameters themselves, off the live module, at the moment the
+    forward is about to use them. Three properties make that the right place:
+
+    * **it needs no reference.** The rollout-only run is the same engine at the
+      same commit with no weight sync, so its dump *is* the reference. Comparing
+      the two answers "do the weights differ" for all 391 at once;
+    * **it is TP-exact.** Reading `named_parameters()` gets this rank's shard as
+      the kernel will see it, so a tensor that arrived complete but was split or
+      assigned wrongly reads as different here -- which a sum of shard norms
+      cannot show, since that is invariant under any permutation;
+    * **it is after everything.** Remap, weight_loader, TP split, dtype cast and
+      any startup transform have all already happened.
+
+    The fingerprint is a sha256 of the raw bytes plus an fp64 norm. The digest is
+    what actually decides -- it is exact and permutation-sensitive - and the norm
+    is there to say *how far* apart two tensors are once the digest says they
+    are. fp64 because an fp32 norm over a 21M-element table reads 0.1% low and
+    has already cost this investigation a false mismatch.
+
+    Cheap enough to run on every rank: ~400 entries of a few numbers each, a few
+    KB a file, no activation-sized copies. `NEMOTRON_HIDDEN_PROBE_RANKS=all` is
+    the useful setting here, unlike for the hidden states.
+    """
+    if not _weights_wanted():
+        return False
+    if id(model) in _WEIGHTS_ATTACHED:
+        return True
+
+    ranks = _enabled_ranks()
+    rank = _tp_rank()
+    if "all" not in ranks and str(rank) not in ranks:
+        _WEIGHTS_ATTACHED.add(id(model))
+        return False
+
+    root = Path(os.environ["NEMOTRON_HIDDEN_PROBE_DIR"].strip())
+    _WEIGHTS_ATTACHED.add(id(model))
+    try:
+        record = _fingerprint_vision(model)
+    except Exception as exc:  # noqa: BLE001 -- never take the engine down for a log
+        logger.warning("nemotron-probe: could not fingerprint vision weights: %s: %s",
+                       type(exc).__name__, exc)
+        return False
+    _write(root, rank, 0, record, kind="weights")
+    return True
+
+
+def _fingerprint_vision(model) -> dict:
+    """One entry per vision parameter and buffer, from the live module."""
+    import hashlib
+
+    import numpy as np
+
+    entries: dict[str, dict] = {}
+    for prefix, module in (("vision_model", getattr(model, "vision_model", None)),
+                           ("mlp1", getattr(model, "mlp1", None))):
+        if module is None:
+            continue
+        named = list(module.named_parameters()) + list(module.named_buffers())
+        for name, tensor in named:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            # One parameter at a time, and let it go: the whole tower is ~1.3 GB
+            # across the engine, and there is no reason to hold more than the
+            # largest shard at once.
+            array = tensor.detach().to(device="cpu")
+            raw = np.ascontiguousarray(
+                array.to(torch.float32).numpy() if array.is_floating_point() else array.numpy()
+            )
+            entries[f"{prefix}.{name}"] = {
+                "shape": list(array.shape),
+                "dtype": str(array.dtype),
+                "digest": hashlib.sha256(raw.tobytes()).hexdigest()[:16],
+                "norm": float(np.linalg.norm(raw.astype(np.float64))) if raw.dtype.kind == "f" else None,
+                "sum": float(np.asarray(raw, dtype=np.float64).sum()),
+            }
+            del array, raw
+
+    meta = {"entries": entries, "count": len(entries)}
+    try:
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        meta["tp_size"] = get_tensor_model_parallel_world_size()
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info("nemotron-probe: fingerprinted %d vision parameter(s)/buffer(s)", len(entries))
+    return {"meta": meta}
+
+
 def _cpu(tensor):
     """Detached fp32 numpy copy on the host, or None.
 
