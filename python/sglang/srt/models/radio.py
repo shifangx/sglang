@@ -17,6 +17,7 @@
 
 import logging
 import math
+import os
 from collections.abc import Iterable
 from itertools import repeat
 from typing import TypeAlias
@@ -613,6 +614,42 @@ class RadioModel(nn.Module):
                 # load_weights already refuses to be silent about one level up,
                 # for the prefix routing rather than the remap.
                 skipped.append(name)
+
+        # Which parameters this load did NOT write, and whether that is a
+        # problem depends entirely on which load it is.
+        #
+        # At startup it is expected: `ls1` / `ls2` have no tensor in the
+        # released checkpoint, so they keep their constructed value and that is
+        # correct. At a WEIGHT SYNC it is not expected and has already cost a
+        # full investigation -- the engine's memory is released and re-acquired
+        # around the sync, so a parameter the sync does not write does not keep
+        # its old value, it comes back zero. Sixty-four zeroed LayerScale
+        # vectors turn every ViT block into an identity and the tower into a
+        # pass-through, with nothing in any log to say so.
+        self._load_epoch = getattr(self, "_load_epoch", 0) + 1
+        untouched = sorted(set(params_dict) - loaded_params)
+        if untouched:
+            head = untouched[:8]
+            tail = f" (+{len(untouched) - len(head)} more)" if len(untouched) > len(head) else ""
+            if self._load_epoch == 1:
+                logger.info(
+                    "RadioModel: %d parameter(s) had no tensor in this load and keep their "
+                    "constructed value: %s%s. Expected at startup for LayerScale, which the "
+                    "released checkpoint does not carry.",
+                    len(untouched), head, tail,
+                )
+            else:
+                message = (
+                    f"RadioModel: load #{self._load_epoch} left {len(untouched)} parameter(s) "
+                    f"untouched: {head}{tail}. This is a weight sync, not a startup load, and "
+                    "an untouched parameter here is not a parameter that kept its value -- the "
+                    "engine's memory is released and re-acquired around the sync, so it is now "
+                    "zero. Export them (slime megatron_to_hf/nemotron_h.py::_convert_vision) or "
+                    "set NEMOTRON_STRICT_VISION_SYNC=0 to downgrade this to a warning."
+                )
+                if os.environ.get("NEMOTRON_STRICT_VISION_SYNC", "1").strip() not in {"0", "false", "no", "off"}:
+                    raise RuntimeError(message)
+                logger.error(message)
 
         if skipped:
             head = sorted(skipped)[:8]
