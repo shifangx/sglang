@@ -163,6 +163,26 @@ Environment:
                                   ~175 MB a call and ~1.4 GB for four engines at
                                   CALLS=2. Thin the list before raising
                                   ROLLOUT_BATCH_SIZE, not after.
+  NEMOTRON_HIDDEN_PROBE_VISION_INNER
+                                  one level further in: the stages INSIDE the
+                                  listed blocks. `none` (default), `all`, or a
+                                  list with the same spelling as _BLOCKS.
+
+                                  Nine tensors a block: norm1 out, qkv out (per
+                                  TP rank), the attention context (proj's
+                                  input, per rank), proj out, the first
+                                  residual (norm2's input), norm2 out, fc1 out
+                                  (per rank), GELU out, fc2 out. Turn it on
+                                  AFTER the block list has named a block --
+                                  it answers "where inside block N", which is
+                                  not a question until N is known.
+
+                                  Two of the nine are per-rank slices rather
+                                  than whole activations, which is the point:
+                                  a fused qkv re-cut wrongly by head is visible
+                                  in `qkv` and in nothing downstream of the
+                                  all-reduce. Both sides must be read at the
+                                  same rank, which RANKS already guarantees.
 """
 
 from __future__ import annotations
@@ -382,6 +402,11 @@ def _vision_blocks(count: int) -> list[int]:
         return []
     if raw == "all":
         return list(range(count))
+    return _parse_block_list(raw, count)
+
+
+def _parse_block_list(raw: str, count: int) -> list[int]:
+    """`0,15,-1` -> sorted, de-duplicated, resolved block indices."""
     chosen: list[int] = []
     for part in raw.split(","):
         part = part.strip()
@@ -403,6 +428,21 @@ def _vision_blocks(count: int) -> list[int]:
                 part, count,
             )
     return sorted(chosen)
+
+
+def _vision_inner_blocks(count: int) -> list[int]:
+    """Which blocks to open up stage by stage. Default none.
+
+    Separate from NEMOTRON_HIDDEN_PROBE_VISION_BLOCKS because the two answer
+    different questions and cost differently: the block list says WHICH block
+    diverges and is cheap enough to leave on for all 32, this says WHERE INSIDE
+    one block it happens and is only worth turning on once a block has been
+    named. `all` is accepted and is 9 more tensors per block per call.
+    """
+    raw = os.environ.get("NEMOTRON_HIDDEN_PROBE_VISION_INNER", "").strip().lower()
+    if count <= 0 or raw in {"", "none", "off", "false"}:
+        return []
+    return list(range(count)) if raw == "all" else _parse_block_list(raw, count)
 
 
 def _capturing() -> bool:
@@ -625,6 +665,7 @@ def attach_vision(model) -> bool:
     else:
         logger.warning("nemotron-probe: no vision_model.model.patch_generator; patch embed skipped")
 
+    inner = _vision_inner_blocks(len(layers) if layers is not None else 0)
     blocks = _vision_blocks(len(layers) if layers is not None else 0)
     if layers is None:
         logger.warning("nemotron-probe: no vision_model.model.encoder.layers; ViT blocks skipped")
@@ -638,7 +679,43 @@ def attach_vision(model) -> bool:
             )
         for index in blocks:
             stage(f"block{index:02d}", layers[index], inputs=False)
+
+    # One level further in: the seams INSIDE a block, for the case where the
+    # block-level capture has already named a block and the question becomes
+    # which of its eight steps moved first. Every target below is reached
+    # through `Module.__call__`, which is what makes a forward hook fire --
+    # `qkv_backend.forward(...)` is called directly and cannot be hooked, so the
+    # attention context is taken as `proj`'s INPUT instead, which is the same
+    # tensor one rearrange later.
+    #
+    # Two of these are per-TP-rank and not the whole activation: `qkv` is
+    # [.., 3 x heads/tp x 80] and `fc1` is [.., 5120/tp]. That is a feature --
+    # a fused tensor re-cut wrongly by head shows up there and nowhere else --
+    # but it means the two sides must be read at the same rank, which they are:
+    # RANKS selects the same rank on both.
+    if layers is not None and inner:
+        for index in inner:
+            layer = layers[index]
+            tag = f"inner{index:02d}"
+            attn = getattr(getattr(layer, "attn", None), "attn", None)
+            mlp = getattr(layer, "mlp", None)
+            try:
+                # norm1's input is the block's input, which `block<NN>_out` of
+                # the previous block already carries; its output is [a].
+                stage(f"{tag}_norm1", layer.norm1, inputs=False)
+                stage(f"{tag}_qkv", attn.qkv_proj, inputs=False)          # [b]
+                stage(f"{tag}_proj", attn.proj, inputs=True)              # [c] in, [d] out
+                stage(f"{tag}_norm2", layer.norm2, inputs=True)           # [e] in, [f] out
+                stage(f"{tag}_fc1", mlp.fc1, inputs=False)                # pre-activation
+                stage(f"{tag}_act", mlp.act, inputs=False)                # post-GELU
+                stage(f"{tag}_fc2", mlp.fc2, inputs=False)                # [g]
+            except AttributeError as exc:
+                logger.warning(
+                    "nemotron-probe: block %d has no %s; inner stages for it skipped",
+                    index, exc,
+                )
     state["blocks"] = blocks
+    state["inner"] = inner
     state["num_skip"] = getattr(patch_generator, "num_skip", None)
     state["num_layers"] = len(layers) if layers is not None else None
 
@@ -662,6 +739,7 @@ def attach_vision(model) -> bool:
                 "num_skip": state.get("num_skip"),
                 "num_layers": state.get("num_layers"),
                 "blocks": list(state.get("blocks") or ()),
+                "inner": list(state.get("inner") or ()),
             },
             "counts": {},
         }
@@ -692,10 +770,11 @@ def attach_vision(model) -> bool:
     _VISION_ATTACHED.add(id(model))
     logger.info(
         "nemotron-probe: vision probe on tp rank %d, %d call(s), %d elem budget,"
-        " patch embed %s, %d/%s ViT block(s) -> %s",
+        " patch embed %s, %d/%s ViT block(s), inner stages for block(s) %s -> %s",
         rank, limit, budget,
         "on" if patch_generator is not None else "off",
-        len(blocks), state.get("num_layers"), root,
+        len(blocks), state.get("num_layers"),
+        inner or "none", root,
     )
     return True
 
