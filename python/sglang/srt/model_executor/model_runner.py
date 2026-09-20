@@ -179,7 +179,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    weight_update_scope,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -2077,6 +2080,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         group_name,
         load_format: Optional[str] = None,
     ):
+        # `weight_update_scope` is the only thing this wrapper adds: it tells
+        # `load_weights` that the load it is running is an update rather than a
+        # startup load, which some models need in order to judge a parameter no
+        # incoming tensor mentioned.
+        with weight_update_scope():
+            return self._update_weights_from_distributed(
+                names, dtypes, shapes, group_name, load_format
+            )
+
+    def _update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -2160,6 +2180,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False, error_msg
 
     def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
+        load_format: Optional[str] = None,
+    ):
+        # See `update_weights_from_distributed`: the scope is the signal that
+        # this load is one bucket of an update, not the startup load.
+        with weight_update_scope():
+            return self._update_weights_from_tensor(named_tensors, load_format)
+
+    def _update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
@@ -3369,7 +3399,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Create a worker extension that integrates with SGLang's model
             worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
-            worker.update_weights_from_ipc(recv_req.zmq_handles)
+            # Same scope as the other two update paths: the loads this runs are
+            # an update, and a model that judges unwritten parameters needs to
+            # know that.
+            with weight_update_scope():
+                worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
             return False, f"IPC weight update failed: ImportError {e}"

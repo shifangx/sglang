@@ -6,6 +6,7 @@
 
 import collections
 import concurrent.futures
+import contextlib
 import fnmatch
 import glob
 import hashlib
@@ -1341,6 +1342,35 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     if not isinstance(x, torch.Tensor):
         x = x[:]
     return x
+
+
+_WEIGHT_UPDATE_DEPTH = 0
+
+
+@contextlib.contextmanager
+def weight_update_scope():
+    """Mark the window in which `load_weights` is an update, not a startup load.
+
+    `load_weights` looks the same either way, and for most models that is fine.
+    It is not fine for a model that must decide whether a parameter no incoming
+    tensor mentioned is expected (at startup, a value the checkpoint does not
+    carry and the constructor supplies) or a corruption (at an update, where the
+    engine's memory has been released and re-acquired, so an unwritten parameter
+    came back zero rather than kept its value). Counting calls cannot tell them
+    apart: one update is hundreds of calls, one per flattened bucket. The layer
+    that knows is this one, so it says so.
+    """
+    global _WEIGHT_UPDATE_DEPTH
+    _WEIGHT_UPDATE_DEPTH += 1
+    try:
+        yield
+    finally:
+        _WEIGHT_UPDATE_DEPTH -= 1
+
+
+def in_weight_update() -> bool:
+    """True if the `load_weights` running now belongs to a weight update."""
+    return _WEIGHT_UPDATE_DEPTH > 0
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

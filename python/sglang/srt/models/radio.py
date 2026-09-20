@@ -32,6 +32,7 @@ from transformers.modeling_outputs import BaseModelOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    in_weight_update,
     replace_prefix,
     replace_substrings,
 )
@@ -495,11 +496,27 @@ class RadioModel(nn.Module):
             quant_config=quant_config,
         )
 
+        # State for the "no parameter left untouched" check, which spans loads.
+        # A weight sync does not arrive as one load: it arrives as one
+        # `load_weights` per flattened bucket -- 487 of them in the 4-node geo3k
+        # run -- each carrying whatever slice of the model its bucket happened
+        # to hold, and nothing marks the last one. So the question is asked of
+        # the epoch rather than of a load: accumulate the names every bucket
+        # writes, and answer at the first forward, which is the first moment a
+        # zeroed parameter could reach a token. See `_verify_weight_sync`.
+        self._epoch_is_sync = False
+        self._sync_count = 0
+        self._synced_names: set[str] = set()
+        self._loads_this_epoch = 0
+        self._epoch_unverified = False
+
     def forward(
         self,
         pixel_values: torch.Tensor | list[torch.Tensor] | None = None,
         num_frames: int | None = None,
     ) -> torch.FloatTensor:
+        if self._epoch_unverified:
+            self._verify_weight_sync()
         if (
             num_frames is not None
             and getattr(self.config, "video_temporal_patch_size", 1) > 1
@@ -615,41 +632,31 @@ class RadioModel(nn.Module):
                 # for the prefix routing rather than the remap.
                 skipped.append(name)
 
-        # Which parameters this load did NOT write, and whether that is a
-        # problem depends entirely on which load it is.
+        # Record what this load wrote; do not judge it. One load is one
+        # flattened bucket, and a bucket holds whatever slice of the model it
+        # was packed with -- bucket 2 of 487 carrying 3 of the tower's 455
+        # parameters is a normal bucket, not a broken sync. Only the union over
+        # a whole epoch can say whether a parameter went unwritten, so the loads
+        # accumulate here and `_verify_weight_sync` reads the total at the first
+        # forward.
         #
-        # At startup it is expected: `ls1` / `ls2` have no tensor in the
-        # released checkpoint, so they keep their constructed value and that is
-        # correct. At a WEIGHT SYNC it is not expected and has already cost a
-        # full investigation -- the engine's memory is released and re-acquired
-        # around the sync, so a parameter the sync does not write does not keep
-        # its old value, it comes back zero. Sixty-four zeroed LayerScale
-        # vectors turn every ViT block into an identity and the tower into a
-        # pass-through, with nothing in any log to say so.
-        self._load_epoch = getattr(self, "_load_epoch", 0) + 1
-        untouched = sorted(set(params_dict) - loaded_params)
-        if untouched:
-            head = untouched[:8]
-            tail = f" (+{len(untouched) - len(head)} more)" if len(untouched) > len(head) else ""
-            if self._load_epoch == 1:
-                logger.info(
-                    "RadioModel: %d parameter(s) had no tensor in this load and keep their "
-                    "constructed value: %s%s. Expected at startup for LayerScale, which the "
-                    "released checkpoint does not carry.",
-                    len(untouched), head, tail,
-                )
-            else:
-                message = (
-                    f"RadioModel: load #{self._load_epoch} left {len(untouched)} parameter(s) "
-                    f"untouched: {head}{tail}. This is a weight sync, not a startup load, and "
-                    "an untouched parameter here is not a parameter that kept its value -- the "
-                    "engine's memory is released and re-acquired around the sync, so it is now "
-                    "zero. Export them (slime megatron_to_hf/nemotron_h.py::_convert_vision) or "
-                    "set NEMOTRON_STRICT_VISION_SYNC=0 to downgrade this to a warning."
-                )
-                if os.environ.get("NEMOTRON_STRICT_VISION_SYNC", "1").strip() not in {"0", "false", "no", "off"}:
-                    raise RuntimeError(message)
-                logger.error(message)
+        # An epoch ends at that verification, and a load arriving afterwards
+        # opens the next one -- generation is paused for the duration of a sync,
+        # so no forward can fall between two buckets of the same sync. It also
+        # ends when the KIND of load changes, which is the case the forward
+        # alone cannot catch: the tower's first forward is the first image, and
+        # in an RL run that image arrives after the first sync, so startup and
+        # sync #1 would otherwise accumulate into one epoch and be judged by the
+        # startup rule -- the lenient one, and the wrong one.
+        is_sync = in_weight_update()
+        if not self._epoch_unverified or is_sync != self._epoch_is_sync:
+            self._epoch_is_sync = is_sync
+            self._sync_count += int(is_sync)
+            self._synced_names = set()
+            self._loads_this_epoch = 0
+            self._epoch_unverified = True
+        self._synced_names |= loaded_params
+        self._loads_this_epoch += 1
 
         if skipped:
             head = sorted(skipped)[:8]
@@ -665,6 +672,55 @@ class RadioModel(nn.Module):
             )
 
         return loaded_params
+
+    def _verify_weight_sync(self) -> None:
+        """Answer, once per epoch of loads, whether any parameter went unwritten.
+
+        Called from `forward`, which is both the end of the epoch and the reason
+        to care: everything before this point is buckets arriving, and the first
+        forward is the first moment an unwritten parameter can reach a token.
+
+        Whether "unwritten" is a problem depends on the kind of epoch, which
+        `in_weight_update()` reports and a count of loads cannot. At startup it
+        is expected -- `ls1` / `ls2` have no tensor in the released checkpoint,
+        so they keep their constructed value and that is correct. At a weight
+        sync it is not: the engine's memory is released and re-acquired around
+        the sync, so a parameter the sync does not write did not keep its old
+        value, it came back zero. Sixty-four zeroed LayerScale vectors turn
+        every ViT block into an identity and the tower into a pass-through,
+        with nothing in any log to say so.
+        """
+        self._epoch_unverified = False
+
+        untouched = sorted(
+            {name for name, _ in self.named_parameters()} - self._synced_names
+        )
+        if not untouched:
+            return
+
+        head = untouched[:8]
+        tail = f" (+{len(untouched) - len(head)} more)" if len(untouched) > len(head) else ""
+        if not self._epoch_is_sync:
+            logger.info(
+                "RadioModel: %d parameter(s) had no tensor in the startup load and keep "
+                "their constructed value: %s%s. Expected for LayerScale, which the released "
+                "checkpoint does not carry.",
+                len(untouched), head, tail,
+            )
+            return
+
+        message = (
+            f"RadioModel: weight sync #{self._sync_count} left {len(untouched)} "
+            f"parameter(s) untouched across all {self._loads_this_epoch} bucket(s) of the "
+            f"sync: {head}{tail}. This is a weight sync, not a startup load, and an "
+            "untouched parameter here is not a parameter that kept its value -- the "
+            "engine's memory is released and re-acquired around the sync, so it is now "
+            "zero. Export them (slime megatron_to_hf/nemotron_h.py::_convert_vision) or "
+            "set NEMOTRON_STRICT_VISION_SYNC=0 to downgrade this to a warning."
+        )
+        if os.environ.get("NEMOTRON_STRICT_VISION_SYNC", "1").strip() not in {"0", "false", "no", "off"}:
+            raise RuntimeError(message)
+        logger.error(message)
 
     def _extract_final(self, y: torch.Tensor):
         # Remove CLS + REGISTERS tokens
