@@ -141,6 +141,28 @@ Environment:
                                   the metadata regardless, so a truncated tensor
                                   still answers "are these the same" -- it just
                                   cannot say where they differ past the cut.
+  NEMOTRON_HIDDEN_PROBE_VISION_BLOCKS
+                                  the tower's INTERNALS: the patch embedding and
+                                  the per-block outputs of the 32-block ViT
+                                  encoder. `all` (default), `none`, or a list of
+                                  indices -- `0,15,31`, and `-1` is the last
+                                  block. Negative and out-of-range entries are
+                                  dropped rather than raising.
+
+                                  `tower_out` says WHETHER the tower diverged;
+                                  these say WHERE. The first block whose output
+                                  moves is the first block that computes
+                                  something else, and everything after it is a
+                                  consequence -- so a run with these on turns
+                                  "the tower is wrong" into one block index.
+
+                                  Cost: one tensor per captured block per
+                                  get_image_feature call, each capped by
+                                  MAX_ELEMS. At one 480x576 image that is
+                                  1066 x 1280 fp32 = 5.5 MB a block, so `all` is
+                                  ~175 MB a call and ~1.4 GB for four engines at
+                                  CALLS=2. Thin the list before raising
+                                  ROLLOUT_BATCH_SIZE, not after.
 """
 
 from __future__ import annotations
@@ -344,6 +366,45 @@ def _vision_wanted() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _vision_blocks(count: int) -> list[int]:
+    """Which ViT block indices to hook, out of `count` of them.
+
+    `all` (the default) or `none` or a list. An index is resolved the way
+    Python resolves one -- `-1` is the last block -- and anything that does not
+    land inside the encoder is dropped, because a probe that refuses a launch
+    over a typo in a list of diagnostics is worse than one that captures 31 of
+    the 32 blocks and says so in the log.
+    """
+    if count <= 0:
+        return []
+    raw = os.environ.get("NEMOTRON_HIDDEN_PROBE_VISION_BLOCKS", "all").strip().lower()
+    if raw in {"", "none", "0b", "off", "false"}:
+        return []
+    if raw == "all":
+        return list(range(count))
+    chosen: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            index = int(part)
+        except ValueError:
+            logger.warning("nemotron-probe: vision block '%s' is not an integer; ignored", part)
+            continue
+        if index < 0:
+            index += count
+        if 0 <= index < count:
+            if index not in chosen:
+                chosen.append(index)
+        else:
+            logger.warning(
+                "nemotron-probe: vision block %s is outside the encoder's %d block(s); ignored",
+                part, count,
+            )
+    return sorted(chosen)
+
+
 def _capturing() -> bool:
     """True while a CUDA graph is being captured -- see `attach.capturing`."""
     try:
@@ -541,6 +602,46 @@ def attach_vision(model) -> bool:
     except (TypeError, IndexError):
         logger.warning("nemotron-probe: mlp1 is not indexable; projector stages skipped")
 
+    # Inside the tower. `tower_out` answers whether the tower diverged; these
+    # answer where, which is the difference between "diff 391 weights" and
+    # "read block N". Outputs only, for the reason the projector stages are:
+    # block N's input is block N-1's output.
+    #
+    # The layout the comparison has to undo is the extract path's, not this
+    # hook's. On the dynamic path `RadioModel._forward_dynamic` calls the patch
+    # generator once per image and the encoder ONCE over every image's patches
+    # concatenated, so `patch_embed`'s call index is the image index while each
+    # block fires once with `[1, sum(len_i), 1280]`. `num_skip` below is what
+    # lets the comparison cut that back apart: the encoder's rows for image i
+    # are the cls/register prefix plus its patches, where `tower_out`'s
+    # `num_patches_list` counts the patches alone.
+    inner = getattr(tower, "model", None)
+    patch_generator = getattr(inner, "patch_generator", None)
+    encoder = getattr(inner, "encoder", None)
+    layers = getattr(encoder, "layers", None)
+
+    if patch_generator is not None:
+        stage("patch_embed", patch_generator, inputs=False)
+    else:
+        logger.warning("nemotron-probe: no vision_model.model.patch_generator; patch embed skipped")
+
+    blocks = _vision_blocks(len(layers) if layers is not None else 0)
+    if layers is None:
+        logger.warning("nemotron-probe: no vision_model.model.encoder.layers; ViT blocks skipped")
+    elif blocks:
+        if getattr(encoder, "enable_cg", False):
+            # Replay does not dispatch submodule hooks, so the blocks would
+            # silently capture nothing while every other stage kept working.
+            logger.warning(
+                "nemotron-probe: SGLANG_VIT_ENABLE_CUDA_GRAPH is on -- per-block hooks"
+                " only fire on the eager path, so block captures may be missing"
+            )
+        for index in blocks:
+            stage(f"block{index:02d}", layers[index], inputs=False)
+    state["blocks"] = blocks
+    state["num_skip"] = getattr(patch_generator, "num_skip", None)
+    state["num_layers"] = len(layers) if layers is not None else None
+
     def wrapped(items):
         if state["calls"] >= limit or _capturing():
             return original(items)
@@ -555,6 +656,12 @@ def attach_vision(model) -> bool:
                 "is_dynamic": bool(
                     any(getattr(item, "is_dynamic", False) for item in items)
                 ) if hasattr(items, "__iter__") else None,
+                # How the block dumps cut back into images, and which blocks
+                # are in this file at all -- a reader must not have to infer
+                # either from the key names.
+                "num_skip": state.get("num_skip"),
+                "num_layers": state.get("num_layers"),
+                "blocks": list(state.get("blocks") or ()),
             },
             "counts": {},
         }
@@ -584,8 +691,11 @@ def attach_vision(model) -> bool:
     model.get_image_feature = wrapped
     _VISION_ATTACHED.add(id(model))
     logger.info(
-        "nemotron-probe: vision probe on tp rank %d, %d call(s), %d elem budget -> %s",
-        rank, limit, budget, root,
+        "nemotron-probe: vision probe on tp rank %d, %d call(s), %d elem budget,"
+        " patch embed %s, %d/%s ViT block(s) -> %s",
+        rank, limit, budget,
+        "on" if patch_generator is not None else "off",
+        len(blocks), state.get("num_layers"), root,
     )
     return True
 
