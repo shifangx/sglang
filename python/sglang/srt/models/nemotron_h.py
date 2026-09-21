@@ -1180,6 +1180,7 @@ class NemotronHForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> None:
+        strict = getattr(self, "_strict_weight_loading", False)
         # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
         #   what the activation is applied to
         # - FusedMoe.w3 (aka up_proj) should be ignored since we're
@@ -1226,6 +1227,10 @@ class NemotronHForCausalLM(nn.Module):
 
             if "scale" in name:
                 if name not in params_dict:
+                    if strict:
+                        raise ValueError(
+                            f"Unexpected Nemotron-H language weight: {name}"
+                        )
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
@@ -1254,9 +1259,13 @@ class NemotronHForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if not strict and name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
+                    if strict:
+                        raise ValueError(
+                            f"Unexpected Nemotron-H language weight: {name}"
+                        )
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1271,6 +1280,10 @@ class NemotronHForCausalLM(nn.Module):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if name_mapped not in params_dict:
+                        if strict:
+                            raise ValueError(
+                                f"Unexpected Nemotron-H language weight: {name}"
+                            )
                         continue
                     param = params_dict[name_mapped]
                     param.weight_loader(
@@ -1286,7 +1299,11 @@ class NemotronHForCausalLM(nn.Module):
                     if is_expert_weight:
                         continue
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        not strict
+                        and name.endswith(".bias")
+                        and name not in params_dict
+                    ):
                         continue
                     if name in params_dict.keys():
                         param = params_dict[name]
@@ -1295,6 +1312,10 @@ class NemotronHForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
                     else:
+                        if strict:
+                            raise ValueError(
+                                f"Unexpected Nemotron-H language weight: {name}"
+                            )
                         logger.warning(f"Parameter {name} not found in params_dict")
 
 

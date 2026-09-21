@@ -22,6 +22,21 @@ class _RecordingWeight:
 
 
 class TestRadioWeightLoading(CustomTestCase):
+    def test_full_vision_refit_loads_legacy_layerscale_parameters(self):
+        # slime exports the whole frozen vision tower after release/reacquire,
+        # including synthesized LayerScale values absent from the HF checkpoint.
+        for suffix in ("ls1", "ls2"):
+            with self.subTest(suffix=suffix):
+                target = f"model.encoder.layers.0.{suffix}"
+                parameter = _RecordingWeight()
+                model = self._make_model([(target, parameter)])
+                value = torch.ones(4)
+                loaded = model.load_weights(
+                    [(f"radio_model.model.blocks.0.{suffix}", value)]
+                )
+                self.assertEqual(loaded, {target})
+                self.assertEqual(parameter.loads, [(parameter, value, None)])
+
     def _make_model(self, named_parameters=()):
         model = object.__new__(RadioModel)
         nn.Module.__init__(model)

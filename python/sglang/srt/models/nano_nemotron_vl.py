@@ -42,6 +42,7 @@ from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.evs import EVS, EVSConfig
+from sglang.srt.multimodal.nemotron_vl import image_token_counts
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -414,6 +415,9 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
 
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__(config, quant_config, prefix)
+        # A refit must not report success after silently dropping language weights.
+        # Keep the existing permissive handling of quantization-only tensors.
+        self.language_model._strict_weight_loading = quant_config is None
         self.vision_final_layernorm = (
             nn.LayerNorm(
                 config.vit_hidden_size,
@@ -426,6 +430,21 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     @property
     def lm_head(self):
         return self.language_model.lm_head
+
+    def extract_feature_dynamic(self, pixel_values_list: list[torch.Tensor]):
+        images, counts = image_token_counts(
+            pixel_values_list,
+            patch_size=self.config.patch_size,
+            downsample_ratio=self.downsample_ratio,
+        )
+        features = super().extract_feature_dynamic(
+            [image.unsqueeze(0).to(dtype=self.model_dtype) for image in images]
+        )
+        if features.shape[0] != sum(counts):
+            raise ValueError(
+                "RADIO projected feature count does not match the image grid"
+            )
+        return features
 
     def _normalize_vision_features(self, features: torch.Tensor) -> torch.Tensor:
         if self.vision_final_layernorm is None:
