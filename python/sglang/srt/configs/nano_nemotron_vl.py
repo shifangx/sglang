@@ -166,3 +166,28 @@ class NemotronH_Nano_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
         # Explicit __init__ prevents PretrainedConfig.__init_subclass__ from
         # replacing the parent's custom __init__ with a dataclass-generated one.
         super().__init__(*args, **kwargs)
+
+
+class NemotronH_Omni_Reasoning_V3_Config(NemotronH_Nano_VL_V2_Config):
+    """Nemotron 3.5 Super VL -- the Super sibling of the Nano V3 config above.
+
+    Same composition (NemotronH language model + RADIO vision tower + an
+    InternVL-style projector), so nothing here diverges from the parent. Two
+    naming facts make it a separate class rather than another alias:
+
+      * its checkpoints declare ``model_type: nemotron_h_omni``, and
+        ``AutoConfig.register`` requires ``cls.model_type`` to equal the key it
+        is registered under -- the same reason the DeepSeek V3.2/V4 aliases in
+        ``utils/hf_transformers/common.py`` are subclasses rather than reuses;
+      * its architecture string is ``NemotronH_Omni_Reasoning_V3``, without the
+        ``Nano_`` the registered classes carry.
+
+    The model class, unlike this one, is *not* a pure alias -- see
+    ``models/nano_nemotron_vl.py``.
+    """
+
+    model_type = "nemotron_h_omni"
+
+    def __init__(self, *args, **kwargs):
+        # Explicit __init__, same reason as above.
+        super().__init__(*args, **kwargs)

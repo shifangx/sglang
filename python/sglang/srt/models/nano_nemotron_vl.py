@@ -176,6 +176,17 @@ class NemotronH_Nano_VL_V2(EVS):
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
+    def normalize_vision_features(self, vit_embeds: torch.Tensor) -> torch.Tensor:
+        """Hook applied to raw vision-tower output, before pixel shuffle.
+
+        A no-op for the Nano models. Nemotron 3.5 Super carries a LayerNorm here
+        -- see NemotronH_Omni_Reasoning_V3 below -- and LayerNorm acts per token
+        on the last dimension, so applying it to the packed features here is
+        equivalent to the reference implementation's placement just inside the
+        projector.
+        """
+        return vit_embeds
+
     def extract_feature_dynamic(self, pixel_values_list: list[torch.Tensor]):
         """Extract features from variable-size images (dynamic resolution).
 
@@ -183,6 +194,7 @@ class NemotronH_Nano_VL_V2(EVS):
         to RADIO which handles ragged packing with cu_seqlens internally.
         """
         features, num_patches_list = self.vision_model(pixel_values_list)
+        features = self.normalize_vision_features(features)
         patch_size = self.config.patch_size
         results = []
         offset = 0
@@ -201,6 +213,7 @@ class NemotronH_Nano_VL_V2(EVS):
     def extract_video_feature_temporal(self, pixel_values, num_frames):
         """Extract video features with temporal compression (tubelet grouping)."""
         vit_embeds = self.vision_model(pixel_values, num_frames=num_frames)
+        vit_embeds = self.normalize_vision_features(vit_embeds)
         num_tubelets = vit_embeds.shape[0]
         patch_size = self.config.patch_size
         h_patches = pixel_values.shape[-2] // patch_size
@@ -227,6 +240,7 @@ class NemotronH_Nano_VL_V2(EVS):
             batch_size = chunk.shape[0]
             vit_embeds = self.vision_model(chunk)
             vit_embeds = vit_embeds.to(dtype=self.model_dtype)
+            vit_embeds = self.normalize_vision_features(vit_embeds)
             vit_embeds = vit_embeds.reshape(batch_size, h_patches, w_patches, -1)
             vit_embeds = self.pixel_shuffle(
                 vit_embeds, scale_factor=self.downsample_ratio
@@ -388,4 +402,100 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     pass
 
 
-EntryClass = [NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3]
+class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+    """Nemotron 3.5 Super VL. Not an alias of the Nano class -- it has one extra
+    weight-bearing layer.
+
+    Super checkpoints carry ``vision_projector.vision_final_layernorm.{weight,
+    bias}``: a LayerNorm over the RADIO features, applied before pixel shuffle
+    and the projector MLP. It is an artifact of how the model was trained --
+    Megatron-Core's TransformerBlock appends a final LayerNorm to every block
+    built from a config with MTP layers, and the vision tower inherits
+    ``mtp_num_layers`` from the language model -- which is why its presence is
+    keyed on the language model having MTP, exactly as the reference
+    implementation does it.
+
+    Loading a Super checkpoint into the Nano class instead would not raise:
+    ``load_weights`` routes by prefix with no else branch, so both tensors would
+    be dropped on the floor and the LayerNorm would silently be skipped,
+    leaving every image embedding wrong. Hence a separate class.
+    """
+
+    # Checkpoint prefix for the extra LayerNorm. The reference model nests the
+    # projector under `vision_projector`; sglang keeps mlp1 at the top level, so
+    # only this one tensor pair needs rerouting.
+    _VISION_FINAL_LAYERNORM_PREFIX = "vision_projector.vision_final_layernorm."
+
+    def __init__(
+        self,
+        config: NemotronH_Nano_VL_V2_Config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+
+        if (getattr(config.llm_config, "num_nextn_predict_layers", 0) or 0) > 0:
+            self.vision_final_layernorm = nn.LayerNorm(
+                config.vit_hidden_size,
+                eps=config.raw_vision_config.get("layer_norm_eps", 1e-6),
+            ).to(self.model_dtype)
+        else:
+            self.vision_final_layernorm = None
+
+        # Set once the initial checkpoint load has been verified complete. See
+        # load_weights: completeness is only a meaningful question on that call.
+        self._vision_final_layernorm_checked = False
+
+    def normalize_vision_features(self, vit_embeds: torch.Tensor) -> torch.Tensor:
+        if self.vision_final_layernorm is None:
+            return vit_embeds
+        return self.vision_final_layernorm(vit_embeds)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        prefix = self._VISION_FINAL_LAYERNORM_PREFIX
+        remaining = []
+        loaded = set()
+        for name, w in weights:
+            if not name.startswith(prefix):
+                remaining.append((name, w))
+                continue
+            if self.vision_final_layernorm is None:
+                raise ValueError(
+                    f"checkpoint carries {name} but this model was built without a vision "
+                    f"final LayerNorm, which is keyed on llm_config.num_nextn_predict_layers > 0"
+                )
+            param_name = name[len(prefix) :]
+            param = getattr(self.vision_final_layernorm, param_name)
+            with torch.no_grad():
+                default_weight_loader(param, w)
+            loaded.add(param_name)
+
+        # The base loader silently ignores names it does not recognize, so a
+        # renamed or absent tensor here would otherwise leave the LayerNorm at
+        # its init values -- identity-ish, wrong, and invisible in the log.
+        #
+        # That check only makes sense on the INITIAL load, which is the one
+        # call that is handed the whole checkpoint. RL weight sync calls this
+        # method again, once per bucket
+        # (model_runner.py:_update_weights_from_flattened_bucket), and a bucket
+        # is an arbitrary subset -- these two tensors are 2 of ~43k, so almost
+        # every bucket carries neither, and a blanket assertion would fire on
+        # the first sync of any RL run, on every rank at once.
+        #
+        # So: demand both on the first call, and assert nothing on the rest.
+        if self.vision_final_layernorm is not None and not self._vision_final_layernorm_checked:
+            if loaded != {"weight", "bias"}:
+                raise ValueError(
+                    f"expected {prefix}weight and {prefix}bias in the checkpoint, "
+                    f"loaded {sorted(loaded)}"
+                )
+            self._vision_final_layernorm_checked = True
+
+        super().load_weights(remaining)
+
+
+EntryClass = [
+    NemotronH_Nano_VL_V2,
+    NemotronH_Nano_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3,
+]
