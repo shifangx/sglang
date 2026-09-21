@@ -63,7 +63,6 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
     models = [
         NemotronH_Nano_VL_V2,
         NemotronH_Nano_Omni_Reasoning_V3,
-        NemotronH_Omni_Reasoning_V3,
     ]
     gpu_image_decode = (
         False  # NanoNemotronVL processes loaded image as PIL image explicitly

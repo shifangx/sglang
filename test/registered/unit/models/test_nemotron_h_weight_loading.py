@@ -48,6 +48,22 @@ class _RecordingStackedParam:
 
 
 class TestNemotronHWeightLoading(CustomTestCase):
+    def test_strict_language_refit_rejects_unrecognized_weights(self):
+        model = self._make_minimal_model()
+        model._strict_weight_loading = True
+        for name in (
+            "model.unknown.weight",
+            "model.unknown.bias",
+            "model.layers.1.mixer.experts.0.down_proj.weight",
+        ):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    ValueError, "Unexpected Nemotron-H language weight"
+                ),
+            ):
+                model.load_weights([(name, torch.ones(1))])
+
     def _make_minimal_model(
         self, named_parameters=(), model_class=NemotronHForCausalLM
     ):
