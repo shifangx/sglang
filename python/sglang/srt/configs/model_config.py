@@ -616,6 +616,17 @@ class ModelConfig:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        # The VL siblings of the above. A separate entry because the draft is a
+        # pure language model while this config nests one: the draft class
+        # unwraps llm_config and strips the checkpoint's language_model. prefix,
+        # which NemotronHForCausalLMMTP does not do. num_nextn_predict_layers
+        # lives on the nested config here, and the checkpoint already sets it.
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "NemotronH_Omni_Reasoning_V3",
+            "NemotronH_Nano_VL_V2",
+        ]:
+            self.hf_config.architectures[0] = "NemotronHVLForCausalLMMTP"
+
         if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1

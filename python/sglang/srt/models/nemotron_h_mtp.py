@@ -371,4 +371,53 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
         super().load_weights(weights, is_mtp=True)
 
 
-EntryClass = [NemotronHForCausalLMMTP]
+class NemotronHVLForCausalLMMTP(NemotronHForCausalLMMTP):
+    """The EAGLE draft for the Nemotron-H *VL* checkpoints.
+
+    The draft is a pure language model: EAGLE's draft forward consumes
+    ``forward_batch.spec_info.hidden_states`` and never touches pixels. So the
+    whole difference from the text draft is where the config and the weight
+    names live.
+
+    Config: these checkpoints nest the language model as ``llm_config`` (a
+    ``NemotronHConfig``, see ``configs/nano_nemotron_vl.py:74``), so it is
+    unwrapped here. ``mtp_layers_block_type`` defaults to attention-then-MoE,
+    which is what the Nemotron 3.5 Super checkpoint serializes -- one ``*E``
+    block, ``num_nextn_predict_layers: 1``.
+
+    Weights: everything the language model owns is stored under a
+    ``language_model.`` prefix. Rewriting the prefix rather than wrapping the
+    iterator keeps this on the mechanism the parent already uses, and the order
+    matters -- ``language_model.backbone`` has to be consumed before the bare
+    ``language_model.``, because ``replace_prefix`` applies every matching rule
+    in turn rather than stopping at the first.
+
+    The vision keys need no rule: nothing rewrites them, and the parent's
+    ``is_mtp`` filter drops every name without ``mtp`` in it
+    (``nemotron_h.py:1109-1111``), which is exactly the set a language draft
+    does not own.
+    """
+
+    remap_prefix = {
+        "language_model.backbone": "model",
+        "language_model.": "",
+        "backbone": "model",
+    }
+
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        llm_config = getattr(config, "llm_config", None)
+        if llm_config is None:
+            raise ValueError(
+                f"{type(config).__name__} has no llm_config; "
+                "NemotronHVLForCausalLMMTP is for the VL checkpoints, whose language model "
+                "is nested. Use NemotronHForCausalLMMTP for the text ones."
+            )
+        super().__init__(llm_config, quant_config=quant_config, prefix=prefix)
+
+
+EntryClass = [NemotronHForCausalLMMTP, NemotronHVLForCausalLMMTP]

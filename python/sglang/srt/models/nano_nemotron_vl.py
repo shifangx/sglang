@@ -228,6 +228,23 @@ class NemotronH_Nano_VL_V2(EVS):
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
+    def get_embed_and_head(self):
+        """The tensors EAGLE hands to its draft (``eagle_worker_v2.py:328``).
+
+        Delegated, because on this family the embedding and the head belong to
+        the nested language model -- the draft is a pure language model and
+        never sees the vision half. Without this the speculative path raises
+        AttributeError on the *target* during draft setup, before any
+        mis-drafting could show up as a low acceptance rate.
+        """
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        """The inverse, for completeness: this class is a target rather than a
+        draft, but the pair is looked up by name and keeping them together is
+        what stops the next reader from wondering which half is missing."""
+        return self.language_model.set_embed_and_head(embed, head)
+
     def extract_feature(self, pixel_values):
         micro_batch_size = 128
         n = pixel_values.shape[0]
