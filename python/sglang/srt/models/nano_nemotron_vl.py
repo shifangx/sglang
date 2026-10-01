@@ -420,93 +420,61 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
 
 
 class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
-    """Nemotron 3.5 Super VL. Not an alias of the Nano class -- it has one extra
-    weight-bearing layer.
+    """Nemotron 3.5 Super VL, pinned to vLLM's vision semantics.
 
-    Super checkpoints carry ``vision_projector.vision_final_layernorm.{weight,
-    bias}``: a LayerNorm over the RADIO features, applied before pixel shuffle
-    and the projector MLP. It is an artifact of how the model was trained --
-    Megatron-Core's TransformerBlock appends a final LayerNorm to every block
-    built from a config with MTP layers, and the vision tower inherits
-    ``mtp_num_layers`` from the language model -- which is why its presence is
-    keyed on the language model having MTP, exactly as the reference
-    implementation does it.
+    The released Super checkpoint carries
+    ``vision_projector.vision_final_layernorm.{weight,bias}``: a LayerNorm over
+    the RADIO features, applied before pixel shuffle and the projector MLP. It is
+    an artifact of how the model was trained -- Megatron-Core's TransformerBlock
+    appends a final LayerNorm to every block built from a config with MTP layers,
+    and the vision tower's config inherited ``mtp_num_layers`` from the language
+    model.
 
-    Loading a Super checkpoint into the Nano class instead would not raise:
-    ``load_weights`` routes by prefix with no else branch, so both tensors would
-    be dropped on the floor and the LayerNorm would silently be skipped,
-    leaving every image embedding wrong. Hence a separate class.
+    **This class deliberately does not apply it**, because vLLM does not: the
+    nightly this stack is compared against registers
+    ``NemotronH_Omni_Reasoning_V3`` onto ``NemotronH_Nano_VL_V2``
+    (``vllm/model_executor/models/registry.py``), which has no such module, and
+    whose prefix-routing ``load_weights`` therefore drops both tensors. Running
+    one engine's semantics on the rollout side and another's on the serving side
+    is what this pin removes.
+
+    The GRPO actor is stripped to match -- ``_align_vision_modules_with_vllm`` in
+    ``slime_plugins/models/nemotron_h_vl.py`` sets the projector's
+    ``vision_final_layernorm`` to ``None`` -- so the trainer and this engine
+    compute the same vision features and
+    ``train_rollout_logprob_abs_diff`` stays meaningful. Changing one side
+    without the other silently reintroduces the mismatch this file used to fix.
+
+    Both tensors are still *present* in the released checkpoint, so cold start
+    hands them to ``load_weights``; they are consumed and discarded here rather
+    than left to fall off the end of the base class's prefix chain, so that the
+    drop is visible in the code and countable in the log.
     """
 
-    # Checkpoint prefix for the extra LayerNorm. The reference model nests the
-    # projector under `vision_projector`; sglang keeps mlp1 at the top level, so
-    # only this one tensor pair needs rerouting.
+    # Checkpoint prefix for the LayerNorm this class does not build.
     _VISION_FINAL_LAYERNORM_PREFIX = "vision_projector.vision_final_layernorm."
-
-    def __init__(
-        self,
-        config: NemotronH_Nano_VL_V2_Config,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(config, quant_config=quant_config, prefix=prefix)
-
-        if (getattr(config.llm_config, "num_nextn_predict_layers", 0) or 0) > 0:
-            self.vision_final_layernorm = nn.LayerNorm(
-                config.vit_hidden_size,
-                eps=config.raw_vision_config.get("layer_norm_eps", 1e-6),
-            ).to(self.model_dtype)
-        else:
-            self.vision_final_layernorm = None
-
-        # Set once the initial checkpoint load has been verified complete. See
-        # load_weights: completeness is only a meaningful question on that call.
-        self._vision_final_layernorm_checked = False
-
-    def normalize_vision_features(self, vit_embeds: torch.Tensor) -> torch.Tensor:
-        if self.vision_final_layernorm is None:
-            return vit_embeds
-        return self.vision_final_layernorm(vit_embeds)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         prefix = self._VISION_FINAL_LAYERNORM_PREFIX
         remaining = []
-        loaded = set()
+        discarded = []
         for name, w in weights:
-            if not name.startswith(prefix):
-                remaining.append((name, w))
+            if name.startswith(prefix):
+                discarded.append(name)
                 continue
-            if self.vision_final_layernorm is None:
-                raise ValueError(
-                    f"checkpoint carries {name} but this model was built without a vision "
-                    f"final LayerNorm, which is keyed on llm_config.num_nextn_predict_layers > 0"
-                )
-            param_name = name[len(prefix) :]
-            param = getattr(self.vision_final_layernorm, param_name)
-            with torch.no_grad():
-                default_weight_loader(param, w)
-            loaded.add(param_name)
+            remaining.append((name, w))
 
-        # The base loader silently ignores names it does not recognize, so a
-        # renamed or absent tensor here would otherwise leave the LayerNorm at
-        # its init values -- identity-ish, wrong, and invisible in the log.
-        #
-        # That check only makes sense on the INITIAL load, which is the one
-        # call that is handed the whole checkpoint. RL weight sync calls this
-        # method again, once per bucket
-        # (model_runner.py:_update_weights_from_flattened_bucket), and a bucket
-        # is an arbitrary subset -- these two tensors are 2 of ~43k, so almost
-        # every bucket carries neither, and a blanket assertion would fire on
-        # the first sync of any RL run, on every rank at once.
-        #
-        # So: demand both on the first call, and assert nothing on the rest.
-        if self.vision_final_layernorm is not None and not self._vision_final_layernorm_checked:
-            if loaded != {"weight", "bias"}:
-                raise ValueError(
-                    f"expected {prefix}weight and {prefix}bias in the checkpoint, "
-                    f"loaded {sorted(loaded)}"
-                )
-            self._vision_final_layernorm_checked = True
+        # Cold start sees both; an RL weight-sync bucket should see neither,
+        # because the actor no longer has the parameters to send. Either way the
+        # count goes to the log -- a nonzero count during sync means the actor
+        # was not stripped and the two sides have diverged.
+        if discarded:
+            logger.info(
+                "NemotronH_Omni_Reasoning_V3: discarded %d vision_final_layernorm tensor(s) "
+                "(%s) -- this model is pinned to vLLM, which has no such module",
+                len(discarded),
+                ", ".join(sorted(discarded)),
+            )
 
         super().load_weights(remaining)
 

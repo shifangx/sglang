@@ -593,6 +593,20 @@ class RadioModel(nn.Module):
                 continue
             name = replace_substrings(name, remap_substrings)
             name = replace_prefix(name, remap_prefixes)
+            # LayerScale. `ls1`/`ls2` are built as `initializer_factor * ones`
+            # by InternVisionEncoderLayer (models/internvl.py:249-250) and are
+            # never overwritten here, matching vLLM
+            # (vllm/model_executor/models/radio.py:733-734 skips the same two
+            # suffixes). C-RADIO ships no layerscale, so the released checkpoint
+            # has no such tensor and this skip is inert on cold start; what it
+            # pins is the RL weight sync, where an actor that still trained the
+            # gate would otherwise move the engine off the constant 1.0 that
+            # vLLM is permanently on. The GRPO actor is stripped to match
+            # (_align_vision_modules_with_vllm replaces the modules with
+            # nn.Identity), so in a correct run nothing reaches this line.
+            suffix = name.rsplit(".", 1)[-1] if name else ""
+            if suffix in {"ls1", "ls2"}:
+                continue
             if name and name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
