@@ -246,8 +246,31 @@ class InternVisionEncoderLayer(nn.Module):
         self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
         self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
 
-        self.ls1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
-        self.ls2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+        # C-RADIO reuses this layer but ships no LayerScale: RadioConfig pins
+        # initializer_factor to 1.0 (configs/radio.py:73) so the gate is an
+        # identity, and no RADIO checkpoint carries ls1/ls2. Materialising it
+        # anyway would put two nn.Parameters per layer in named_parameters()
+        # that the weight sync has to own for a constant, inside the pool
+        # release_memory_occupation gives back in a colocated run. A plain float
+        # keeps `* self.ls1` below working, costs no device memory, and is
+        # re-derived in every process. The trainer side of this is
+        # slime_plugins/models/nemotron_h_vl.py, which drops the matching
+        # RadioLayerScale modules -- the two halves must ship together.
+        #
+        # Gated on model_type, not on initializer_factor: InternViT defaults it
+        # to 0.1 (configs/internvl.py:230) but real InternViT checkpoints do
+        # carry ls1/ls2, and InternVLChatModel.load_weights indexes params_dict
+        # unguarded, so dropping them for InternVL would be a KeyError.
+        if getattr(config, "model_type", None) == "radio":
+            self.ls1 = 1.0
+            self.ls2 = 1.0
+        else:
+            self.ls1 = nn.Parameter(
+                config.initializer_factor * torch.ones(self.embed_dim)
+            )
+            self.ls2 = nn.Parameter(
+                config.initializer_factor * torch.ones(self.embed_dim)
+            )
         self.drop_path1 = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
