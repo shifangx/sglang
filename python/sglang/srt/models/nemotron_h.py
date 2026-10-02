@@ -206,6 +206,9 @@ class NemotronHMoE(nn.Module):
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
+            # Routed-experts capture (return_routed_experts) indexes its buffer
+            # by layer_id; without it every MoE layer writes the whole buffer.
+            layer_id=layer_idx,
             use_grouped_topk=True,
             topk_group=config.topk_group,
             num_expert_group=config.n_group,
