@@ -609,6 +609,22 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        # The Nemotron VL / Omni wrappers carry the language model as llm_config, a
+        # NemotronHConfig, and the MTP head belongs to it: the checkpoint stores it at
+        # language_model.mtp.*. The draft is a text-only NemotronH MTP head, so build
+        # it from llm_config and let the mapping below pick the MTP class.
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "NemotronH_Nano_VL_V2",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
+        ]:
+            vl_config = self.hf_config
+            self.hf_config = vl_config.llm_config
+            self.hf_config.architectures = ["NemotronHForCausalLM"]
+            # NemotronHForCausalLMMTP maps multimodal pad ids back to this token.
+            self.hf_config.img_context_token_id = vl_config.img_context_token_id
+            self.hf_text_config = get_hf_text_config(self.hf_config)
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "NemotronHForCausalLM",
             "NemotronHPuzzleForCausalLM",

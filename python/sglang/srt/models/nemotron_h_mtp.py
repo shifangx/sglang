@@ -355,6 +355,21 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     ) -> torch.Tensor:
         hidden_states = forward_batch.spec_info.hidden_states
 
+        # Draft of a Nemotron VL / Omni target (model_config.py sets this). The
+        # scheduler has replaced every <image> id with a per-image pad value
+        # (MM_PAD_SHIFT_VALUE + hash, always >= vocab_size). Map those back to
+        # <image> so the MTP embeds that token's own vector, which is what
+        # Megatron's MTP sees during training (HybridModel passes input_ids to
+        # embedding(), not the vision-injected decoder input). Only images are
+        # handled: video / audio pads would also land on <image>.
+        img_context_token_id = getattr(self.config, "img_context_token_id", None)
+        if img_context_token_id is not None and input_embeds is None:
+            input_ids = torch.where(
+                input_ids >= self.config.vocab_size,
+                torch.full_like(input_ids, img_context_token_id),
+                input_ids,
+            )
+
         hidden_states = self.model(
             input_ids,
             hidden_states,
@@ -368,6 +383,12 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        # Nemotron VL / Omni checkpoints -- and slime's weight sync for them --
+        # name the MTP head language_model.mtp.*. Without this strip the parent
+        # would map it to language_model.model.layers.*, find no such parameter
+        # and skip it, leaving the draft on uninitialised weights. Vision keys
+        # carry no "mtp" and are dropped by the parent as before.
+        weights = ((name.removeprefix("language_model."), w) for name, w in weights)
         super().load_weights(weights, is_mtp=True)
 
 

@@ -116,6 +116,15 @@ class NemotronH_Nano_VL_V2(EVS):
 
         self.config = config
 
+    # EAGLE / MTP speculative decoding shares the target's embedding and LM head
+    # with the draft (NemotronHForCausalLMMTP), and asks the *outer* model for
+    # them. Both live on the language model.
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
+
     def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
