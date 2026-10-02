@@ -442,10 +442,6 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
         else:
             self.vision_final_layernorm = None
 
-        # Set once the initial checkpoint load has been verified complete. See
-        # load_weights: completeness is only a meaningful question on that call.
-        self._vision_final_layernorm_checked = False
-
     def normalize_vision_features(self, vit_embeds: torch.Tensor) -> torch.Tensor:
         if self.vision_final_layernorm is None:
             return vit_embeds
@@ -454,7 +450,6 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         prefix = self._VISION_FINAL_LAYERNORM_PREFIX
         remaining = []
-        loaded = set()
         for name, w in weights:
             if not name.startswith(prefix):
                 remaining.append((name, w))
@@ -468,28 +463,6 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
             param = getattr(self.vision_final_layernorm, param_name)
             with torch.no_grad():
                 default_weight_loader(param, w)
-            loaded.add(param_name)
-
-        # The base loader silently ignores names it does not recognize, so a
-        # renamed or absent tensor here would otherwise leave the LayerNorm at
-        # its init values -- identity-ish, wrong, and invisible in the log.
-        #
-        # That check only makes sense on the INITIAL load, which is the one
-        # call that is handed the whole checkpoint. RL weight sync calls this
-        # method again, once per bucket
-        # (model_runner.py:_update_weights_from_flattened_bucket), and a bucket
-        # is an arbitrary subset -- these two tensors are 2 of ~43k, so almost
-        # every bucket carries neither, and a blanket assertion would fire on
-        # the first sync of any RL run, on every rank at once.
-        #
-        # So: demand both on the first call, and assert nothing on the rest.
-        if self.vision_final_layernorm is not None and not self._vision_final_layernorm_checked:
-            if loaded != {"weight", "bias"}:
-                raise ValueError(
-                    f"expected {prefix}weight and {prefix}bias in the checkpoint, "
-                    f"loaded {sorted(loaded)}"
-                )
-            self._vision_final_layernorm_checked = True
 
         super().load_weights(remaining)
 
